@@ -25,6 +25,7 @@ import org.awaitility.Awaitility;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.reactivestreams.Publisher;
+
 import reactor.core.Fuseable;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -117,10 +118,35 @@ public class LiftFunctionTest {
 		assertThat(liftOperator)
 				.isExactlyInstanceOf(ConnectableLift.class);
 
-		((ConnectableLift) liftOperator).connect(d -> cancelSupportInvoked.set(true));
+		@SuppressWarnings("unchecked")
+		ConnectableLift<Integer, Integer> connectableLiftOperator = ((ConnectableLift<Integer, Integer>) liftOperator);
+
+		connectableLiftOperator.connect(d -> cancelSupportInvoked.set(true));
 
 		Awaitility.await().atMost(1, TimeUnit.SECONDS)
 		          .untilAsserted(() -> assertThat(cancelSupportInvoked).isTrue());
+	}
+
+	//see https://github.com/reactor/reactor-core/issues/1860
+	@Test
+	public void liftConnectableLiftFuseableWithCancelSupport() {
+		AtomicBoolean cancelSupportInvoked = new AtomicBoolean();
+
+		ConnectableFlux<Integer> source = Flux.just(1)
+				.replay();
+
+		Operators.LiftFunction<Integer, Integer> liftFunction =
+				Operators.LiftFunction.liftScannable(null, (s, actual) -> actual);
+		Publisher<Integer> liftOperator = liftFunction.apply(source);
+
+		assertThat(liftOperator)
+				.isExactlyInstanceOf(ConnectableLiftFuseable.class);
+		@SuppressWarnings("unchecked")
+		ConnectableLiftFuseable<Integer, Integer> connectableLifOperator = (ConnectableLiftFuseable<Integer, Integer>) liftOperator;
+		connectableLifOperator.connect(d -> cancelSupportInvoked.set(true));
+
+		Awaitility.await().atMost(1, TimeUnit.SECONDS)
+				.untilAsserted(() -> assertThat(cancelSupportInvoked).isTrue());
 	}
 
 	@Ignore("GroupedFlux is always fuseable for now")

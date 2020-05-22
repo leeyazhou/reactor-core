@@ -16,17 +16,24 @@
 
 package reactor.core.publisher;
 
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
-
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
 
 import org.assertj.core.api.Assertions;
@@ -34,6 +41,7 @@ import org.junit.Test;
 import org.mockito.Mockito;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
 import reactor.core.Fuseable;
@@ -44,6 +52,8 @@ import reactor.core.publisher.Operators.EmptySubscription;
 import reactor.core.publisher.Operators.MonoSubscriber;
 import reactor.core.publisher.Operators.MultiSubscriptionSubscriber;
 import reactor.core.publisher.Operators.ScalarSubscription;
+import reactor.test.StepVerifier;
+import reactor.test.subscriber.AssertSubscriber;
 import reactor.test.util.RaceTestUtils;
 import reactor.util.context.Context;
 
@@ -155,44 +165,63 @@ public class OperatorsTest {
 	public void drainSubscriber() {
 		AtomicBoolean requested = new AtomicBoolean();
 		AtomicBoolean errored = new AtomicBoolean();
-		try {
-			Hooks.onErrorDropped(e -> {
-				assertThat(Exceptions.isErrorCallbackNotImplemented(e)).isTrue();
-				assertThat(e.getCause()).hasMessage("test");
-				errored.set(true);
+		Hooks.onErrorDropped(e -> {
+			assertThat(Exceptions.isErrorCallbackNotImplemented(e)).isTrue();
+			assertThat(e.getCause()).hasMessage("test");
+			errored.set(true);
+		});
+		Flux.from(s -> {
+			assertThat(s).isEqualTo(Operators.drainSubscriber());
+			s.onSubscribe(new Subscription() {
+				@Override
+				public void request(long n) {
+					assertThat(n).isEqualTo(Long.MAX_VALUE);
+					requested.set(true);
+				}
+
+				@Override
+				public void cancel() {
+
+				}
 			});
-			Flux.from(s -> {
-				assertThat(s).isEqualTo(Operators.drainSubscriber());
-				s.onSubscribe(new Subscription() {
-					@Override
-					public void request(long n) {
-						assertThat(n).isEqualTo(Long.MAX_VALUE);
-						requested.set(true);
-					}
+			s.onNext("ignored"); //dropped
+			s.onComplete(); //dropped
+			s.onError(new Exception("test"));
+		})
+		    .subscribe(Operators.drainSubscriber());
 
-					@Override
-					public void cancel() {
-
-					}
-				});
-				s.onNext("ignored"); //dropped
-				s.onComplete(); //dropped
-				s.onError(new Exception("test"));
-			})
-			    .subscribe(Operators.drainSubscriber());
-
-			assertThat(requested.get()).isTrue();
-			assertThat(errored.get()).isTrue();
-		}
-		finally {
-			Hooks.resetOnErrorDropped();
-		}
+		assertThat(requested.get()).isTrue();
+		assertThat(errored.get()).isTrue();
 	}
 
 	@Test
 	public void scanCancelledSubscription() {
 		CancelledSubscription test = CancelledSubscription.INSTANCE;
 		assertThat(test.scan(Scannable.Attr.CANCELLED)).isTrue();
+	}
+
+
+	@Test
+	public void shouldBeSerialIfRacy() {
+		for (int i = 0; i < 10000; i++) {
+			long[] requested = new long[] { 0 };
+			Subscription mockSubscription = Mockito.mock(Subscription.class);
+			Mockito.doAnswer(a -> requested[0] += (long) a.getArgument(0)).when(mockSubscription).request(Mockito.anyLong());
+			DeferredSubscription deferredSubscription = new DeferredSubscription();
+
+			deferredSubscription.request(5);
+
+			RaceTestUtils.race(() -> deferredSubscription.set(mockSubscription),
+					() -> {
+						deferredSubscription.request(10);
+						deferredSubscription.request(10);
+						deferredSubscription.request(10);
+					});
+
+			deferredSubscription.request(15);
+
+			Assertions.assertThat(requested[0]).isEqualTo(50L);
+		}
 	}
 
 	@Test
@@ -279,20 +308,13 @@ public class OperatorsTest {
 		Exception error = new IllegalStateException("boom");
 		DeferredSubscription s = new Operators.DeferredSubscription();
 
-		try {
-			assertThat(s.isCancelled()).as("s initially cancelled").isFalse();
+		assertThat(s.isCancelled()).as("s initially cancelled").isFalse();
 
-			Throwable e = Operators.onNextError("foo", error, c, s);
-			assertThat(e).isNull();
-			assertThat(nextDropped).containsExactly("foo");
-			assertThat(errorDropped).containsExactly(error);
-			assertThat(s.isCancelled()).as("s cancelled").isFalse();
-		}
-		finally {
-			Hooks.resetOnNextDropped();
-			Hooks.resetOnErrorDropped();
-			Hooks.resetOnNextError();
-		}
+		Throwable e = Operators.onNextError("foo", error, c, s);
+		assertThat(e).isNull();
+		assertThat(nextDropped).containsExactly("foo");
+		assertThat(errorDropped).containsExactly(error);
+		assertThat(s.isCancelled()).as("s cancelled").isFalse();
 	}
 
 	@Test
@@ -304,18 +326,12 @@ public class OperatorsTest {
 
 		Context c = Context.of(OnNextFailureStrategy.KEY_ON_NEXT_ERROR_STRATEGY, OnNextFailureStrategy.RESUME_DROP);
 		Exception error = new IllegalStateException("boom");
-		try {
-			assertThat(Hooks.onNextErrorHook).as("no global hook").isNull();
+		assertThat(Hooks.onNextErrorHook).as("no global hook").isNull();
 
-			RuntimeException e = Operators.onNextPollError("foo", error, c);
-			assertThat(e).isNull();
-			assertThat(nextDropped).containsExactly("foo");
-			assertThat(errorDropped).containsExactly(error);
-		}
-		finally {
-			Hooks.resetOnNextDropped();
-			Hooks.resetOnErrorDropped();
-		}
+		RuntimeException e = Operators.onNextPollError("foo", error, c);
+		assertThat(e).isNull();
+		assertThat(nextDropped).containsExactly("foo");
+		assertThat(errorDropped).containsExactly(error);
 	}
 
 	@Test
@@ -730,5 +746,230 @@ public class OperatorsTest {
 
 		Assertions.assertThat(Operators.toConditionalSubscriber(original))
 		          .isSameAs(original);
+	}
+
+	@Test
+	public void discardQueueWithClearContinuesOnExtractionError() {
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Queue<List<Integer>> q = new ArrayBlockingQueue<>(5);
+		q.add(Collections.singletonList(1));
+		q.add(Collections.singletonList(2));
+		q.add(Arrays.asList(3, 30));
+		q.add(Collections.singletonList(4));
+		q.add(Collections.singletonList(5));
+
+		Operators.onDiscardQueueWithClear(q, hookContext, o -> {
+			List<Integer> l = o;
+			if (l.size() == 2) throw new IllegalStateException("boom in extraction");
+			return l.stream();
+		});
+
+		assertThat(discardedCount).hasValue(4);
+	}
+
+	@Test
+	public void discardQueueWithClearContinuesOnExtractedElementNotDiscarded() {
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Queue<List<Integer>> q = new ArrayBlockingQueue<>(5);
+		q.add(Collections.singletonList(1));
+		q.add(Collections.singletonList(2));
+		q.add(Collections.singletonList(3));
+		q.add(Collections.singletonList(4));
+		q.add(Collections.singletonList(5));
+
+		Operators.onDiscardQueueWithClear(q, hookContext, Collection::stream);
+
+		assertThat(discardedCount).as("discarded 1 2 4 5").hasValue(4);
+	}
+
+	@Test
+	public void discardQueueWithClearContinuesOnRawQueueElementNotDiscarded() {
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Queue<Integer> q = new ArrayBlockingQueue<>(5);
+		q.add(1);
+		q.add(2);
+		q.add(3);
+		q.add(4);
+		q.add(5);
+
+		Operators.onDiscardQueueWithClear(q, hookContext, null);
+
+		assertThat(discardedCount).as("discarded 1 2 4 5").hasValue(4);
+	}
+
+	@Test
+	public void discardQueueWithClearStopsOnQueuePollingError() {
+		AtomicInteger discardedCount = new AtomicInteger();
+		@SuppressWarnings("unchecked") Queue<Integer> q = Mockito.mock(Queue.class);
+		Mockito.when(q.poll())
+		       .thenReturn(1, 2)
+		       .thenThrow(new IllegalStateException("poll boom"))
+		       .thenReturn(4, 5)
+		       .thenReturn(null);
+
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> discardedCount.incrementAndGet()).apply(Context.empty());
+
+		Operators.onDiscardQueueWithClear(q, hookContext, null);
+
+		assertThat(discardedCount).as("discarding stops").hasValue(2);
+	}
+
+	@Test
+	public void discardStreamContinuesWhenElementFailsToBeDiscarded() {
+		Stream<Integer> stream = Stream.of(1, 2, 3, 4, 5);
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Operators.onDiscardMultiple(stream, hookContext);
+
+		assertThat(discardedCount).hasValue(4);
+	}
+
+	@Test
+	public void discardStreamStopsOnIterationError() {
+		Stream<Integer> stream = Stream.of(1, 2, 3, 4, 5);
+		//noinspection ResultOfMethodCallIgnored
+		stream.count(); //consumes the Stream on purpose
+
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> discardedCount.incrementAndGet()).apply(Context.empty());
+
+		Operators.onDiscardMultiple(stream, hookContext);
+
+		assertThat(discardedCount).hasValue(0);
+	}
+
+	@Test
+	public void discardCollectionContinuesWhenIteratorElementFailsToBeDiscarded() {
+		List<Integer> elements = Arrays.asList(1, 2, 3, 4, 5);
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Operators.onDiscardMultiple(elements, hookContext);
+
+		assertThat(discardedCount).hasValue(4);
+	}
+
+	@Test
+	public void discardCollectionStopsOnIterationError() {
+		List<Integer> elements = Arrays.asList(1, 2, 3, 4, 5);
+		Iterator<Integer> trueIterator = elements.iterator();
+		Iterator<Integer> failingIterator = new Iterator<Integer>() {
+			@Override
+			public boolean hasNext() {
+				return trueIterator.hasNext();
+			}
+
+			@Override
+			public Integer next() {
+				Integer n = trueIterator.next();
+				if (n >= 3) throw new IllegalStateException("Iterator boom");
+				return n;
+			}
+		};
+		@SuppressWarnings("unchecked")
+		List<Integer> mock = Mockito.mock(List.class);
+		Mockito.when(mock.iterator()).thenReturn(failingIterator);
+
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Operators.onDiscardMultiple(mock, hookContext);
+
+		assertThat(discardedCount).hasValue(2);
+	}
+
+	@Test
+	public void discardCollectionStopsOnIsEmptyError() {
+		@SuppressWarnings("unchecked") List<Integer> mock = Mockito.mock(List.class);
+		Mockito.when(mock.isEmpty()).thenThrow(new IllegalStateException("isEmpty boom"));
+
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> discardedCount.incrementAndGet())
+		                               .apply(Context.empty());
+
+		Operators.onDiscardMultiple(mock, hookContext);
+
+		assertThat(discardedCount).hasValue(0);
+	}
+
+	@Test
+	public void discardIteratorContinuesWhenIteratorElementFailsToBeDiscarded() {
+		List<Integer> elements = Arrays.asList(1, 2, 3, 4, 5);
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Operators.onDiscardMultiple(elements.iterator(), true, hookContext);
+
+		assertThat(discardedCount).hasValue(4);
+	}
+
+	@Test
+	public void discardIteratorStopsOnIterationError() {
+		List<Integer> elements = Arrays.asList(1, 2, 3, 4, 5);
+		Iterator<Integer> trueIterator = elements.iterator();
+		Iterator<Integer> failingIterator = new Iterator<Integer>() {
+			@Override
+			public boolean hasNext() {
+				return trueIterator.hasNext();
+			}
+
+			@Override
+			public Integer next() {
+				Integer n = trueIterator.next();
+				if (n >= 3) throw new IllegalStateException("Iterator boom");
+				return n;
+			}
+		};
+		AtomicInteger discardedCount = new AtomicInteger();
+		Context hookContext = Operators.discardLocalAdapter(Integer.class, i -> {
+			if (i == 3) throw new IllegalStateException("boom");
+			discardedCount.incrementAndGet();
+		}).apply(Context.empty());
+
+		Operators.onDiscardMultiple(failingIterator, true, hookContext);
+
+		assertThat(discardedCount).hasValue(2);
+	}
+
+	// see https://github.com/reactor/reactor-core/issues/2152
+	@Test
+	public void reportThrowInSubscribeWithFuseableErrorResumed() {
+		AssertSubscriber<Integer> assertSubscriber = AssertSubscriber.create();
+		FluxOnErrorResume.ResumeSubscriber<Integer> resumeSubscriber = new FluxOnErrorResume.ResumeSubscriber<>(
+				assertSubscriber, t -> Mono.just(123));
+		FluxMapFuseable.MapFuseableSubscriber<String, Integer> fuseableSubscriber = new FluxMapFuseable.MapFuseableSubscriber<>(
+				resumeSubscriber, String::length);
+
+		Operators.reportThrowInSubscribe(fuseableSubscriber, new RuntimeException("boom"));
+
+		assertSubscriber.assertNoError().awaitAndAssertNextValues(123);
 	}
 }

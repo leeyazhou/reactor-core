@@ -1,13 +1,16 @@
 package reactor.core.scheduler;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Phaser;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import io.micrometer.core.instrument.FunctionCounter;
+import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -86,7 +89,7 @@ public class SchedulersMetricsTest {
 
 						"single(\"B\")",
 
-						"boundedElastic(\"C\",maxThreads=4,maxTaskQueued=100,ttl=60s)"
+						"boundedElastic(\"C\",maxThreads=4,maxTaskQueuedPerThread=100,ttl=60s)"
 				);
 	}
 
@@ -154,8 +157,8 @@ public class SchedulersMetricsTest {
 		                              .map(m -> m.getId().getTag("name"))
 		                              .distinct())
 				.containsOnly(
-						"boundedElastic(\"TWICE\",maxThreads=4,maxTaskQueued=100,ttl=1s)-0",
-						"boundedElastic(\"TWICE\",maxThreads=4,maxTaskQueued=100,ttl=1s)-1"
+						"boundedElastic(\"TWICE\",maxThreads=4,maxTaskQueuedPerThread=100,ttl=1s)-0",
+						"boundedElastic(\"TWICE\",maxThreads=4,maxTaskQueuedPerThread=100,ttl=1s)-1"
 				);
 	}
 
@@ -250,10 +253,65 @@ public class SchedulersMetricsTest {
 			assertThat(timers.stream()
 			                 .reduce(0d, (time, timer) -> time + timer.totalTime(TimeUnit.MILLISECONDS), Double::sum))
 					.as("total durations")
-					.isEqualTo(600 + 400 + 200, offset(20.0d));
+					.isEqualTo(600 + 400 + 200, offset(50d));
 			assertThat(timers.stream().mapToLong(Timer::count).sum())
 					.as("count")
 					.isEqualTo(taskCount);
 		});
+	}
+
+	@Test
+	public void shouldRemoveOnShutdown() throws Exception {
+		int ttl = 1;
+		Scheduler scheduler = afterTest.autoDispose(Schedulers.newElastic("A", ttl));
+		String schedulerName = scheduler.toString();
+
+		Scheduler.Worker worker0 = scheduler.createWorker();
+		Scheduler.Worker worker1 = scheduler.createWorker();
+
+		Predicate<Meter.Id> schedulerPredicate = it -> {
+			return schedulerName.equals(it.getTag(TAG_SCHEDULER_ID));
+		};
+
+		assertThat(simpleMeterRegistry.getMeters())
+				.extracting(Meter::getId)
+				.anyMatch(schedulerPredicate);
+
+		worker1.dispose();
+
+		await().atMost(5, TimeUnit.SECONDS).untilAsserted(() -> {
+			((ElasticScheduler) scheduler).eviction();
+
+			List<Meter> meters = simpleMeterRegistry.getMeters();
+			assertThat(meters)
+					.extracting(Meter::getId)
+					.anyMatch(it -> (schedulerName + "-0").equals(it.getTag("name")))
+					.noneMatch(it -> (schedulerName + "-1").equals(it.getTag("name")));
+		});
+
+		scheduler.dispose();
+
+		assertThat(simpleMeterRegistry.getMeters())
+				.extracting(Meter::getId)
+				.noneMatch(schedulerPredicate);
+	}
+
+	@Test
+	public void shouldRemoveAllOnDispose() {
+		Scheduler scheduler = afterTest.autoDispose(Schedulers.newParallel("A", 2));
+
+		Predicate<Meter.Id> meterPredicate = it -> {
+			return scheduler.toString().equals(it.getTag(TAG_SCHEDULER_ID));
+		};
+
+		assertThat(simpleMeterRegistry.getMeters())
+				.extracting(Meter::getId)
+				.anyMatch(meterPredicate);
+
+		scheduler.dispose();
+
+		assertThat(simpleMeterRegistry.getMeters())
+				.extracting(Meter::getId)
+				.noneMatch(meterPredicate);
 	}
 }

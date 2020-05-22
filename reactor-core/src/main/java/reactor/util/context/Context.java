@@ -185,8 +185,9 @@ public interface Context {
 				throw new NullPointerException("null value for key " + key);
 			}
 		});
-		//noinspection unchecked
-		return new ContextN((Map) map);
+		@SuppressWarnings("unchecked")
+		final Map<Object, Object> generifiedMap = (Map<Object, Object>) map;
+		return new ContextN(generifiedMap);
 	}
 
 	/**
@@ -348,8 +349,8 @@ public interface Context {
 		}
 
 		ContextN newContext = new ContextN(this.size() + other.size());
-		this.stream().forEach(newContext);
-		other.stream().forEach(newContext);
+		this.stream().sequential().forEach(newContext);
+		other.stream().sequential().forEach(newContext);
 		if (newContext.size() <= 5) {
 			// make it return Context{1-5}
 			return Context.of(newContext);

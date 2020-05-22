@@ -24,6 +24,7 @@ import java.util.stream.Stream;
 
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CorePublisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
@@ -63,7 +64,14 @@ final class MonoDelayUntil<T> extends Mono<T> implements Scannable,
 			Function<? super T, ? extends Publisher<?>>[] triggerGenerators) {
 		this.source = Objects.requireNonNull(monoSource, "monoSource");
 		this.otherGenerators = triggerGenerators;
-		this.optimizableOperator = source instanceof OptimizableOperator ? (OptimizableOperator) source : null;
+		if (source instanceof OptimizableOperator) {
+			@SuppressWarnings("unchecked")
+			OptimizableOperator<?, T> optimSource = (OptimizableOperator<?, T>) source;
+			this.optimizableOperator = optimSource;
+		}
+		else {
+			this.optimizableOperator = null;
+		}
 	}
 
 	/**
@@ -85,11 +93,17 @@ final class MonoDelayUntil<T> extends Mono<T> implements Scannable,
 
 	@Override
 	public void subscribe(CoreSubscriber<? super T> actual) {
-		source.subscribe(subscribeOrReturn(actual));
+		try {
+			source.subscribe(subscribeOrReturn(actual));
+		}
+		catch (Throwable e) {
+			Operators.error(actual, Operators.onOperatorError(e, actual.currentContext()));
+			return;
+		}
 	}
 
 	@Override
-	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) {
+	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) throws Throwable {
 		DelayUntilCoordinator<T> parent = new DelayUntilCoordinator<>(actual, otherGenerators);
 		actual.onSubscribe(parent);
 

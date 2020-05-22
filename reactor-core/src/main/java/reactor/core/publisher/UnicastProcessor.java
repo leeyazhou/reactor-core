@@ -154,6 +154,7 @@ public final class UnicastProcessor<T>
 	volatile boolean done;
 	Throwable error;
 
+	boolean hasDownstream; //important to not loose the downstream too early and miss discard hook, while having relevant hasDownstreams()
 	volatile CoreSubscriber<? super T> actual;
 
 	volatile boolean cancelled;
@@ -167,6 +168,11 @@ public final class UnicastProcessor<T>
 	@SuppressWarnings("rawtypes")
 	static final AtomicIntegerFieldUpdater<UnicastProcessor> WIP =
 			AtomicIntegerFieldUpdater.newUpdater(UnicastProcessor.class, "wip");
+
+	volatile int discardGuard;
+	@SuppressWarnings("rawtypes")
+	static final AtomicIntegerFieldUpdater<UnicastProcessor> DISCARD_GUARD =
+			AtomicIntegerFieldUpdater.newUpdater(UnicastProcessor.class, "discardGuard");
 
 	volatile long requested;
 	@SuppressWarnings("rawtypes")
@@ -203,6 +209,7 @@ public final class UnicastProcessor<T>
 	@Override
 	public Object scanUnsafe(Attr key) {
 		if (Attr.BUFFERED == key) return queue.size();
+		if (Attr.PREFETCH == key) return Integer.MAX_VALUE;
 		return super.scanUnsafe(key);
 	}
 
@@ -213,7 +220,7 @@ public final class UnicastProcessor<T>
 		}
 	}
 
-	void drainRegular(Subscriber<? super T> a) {
+	void drainRegular(CoreSubscriber<? super T> a) {
 		int missed = 1;
 
 		final Queue<T> q = queue;
@@ -229,7 +236,7 @@ public final class UnicastProcessor<T>
 				T t = q.poll();
 				boolean empty = t == null;
 
-				if (checkTerminated(d, empty, a, q)) {
+				if (checkTerminated(d, empty, a, q, t)) {
 					return;
 				}
 
@@ -243,7 +250,7 @@ public final class UnicastProcessor<T>
 			}
 
 			if (r == e) {
-				if (checkTerminated(done, q.isEmpty(), a, q)) {
+				if (checkTerminated(done, q.isEmpty(), a, q, null)) {
 					return;
 				}
 			}
@@ -259,7 +266,7 @@ public final class UnicastProcessor<T>
 		}
 	}
 
-	void drainFused(Subscriber<? super T> a) {
+	void drainFused(CoreSubscriber<? super T> a) {
 		int missed = 1;
 
 		final Queue<T> q = queue;
@@ -267,8 +274,10 @@ public final class UnicastProcessor<T>
 		for (;;) {
 
 			if (cancelled) {
-				q.clear();
-				actual = null;
+				// We are the holder of the queue, but we still have to perform discarding under the guarded block
+				// to prevent any racing done by downstream
+				this.clear();
+				hasDownstream = false;
 				return;
 			}
 
@@ -277,7 +286,7 @@ public final class UnicastProcessor<T>
 			a.onNext(null);
 
 			if (d) {
-				actual = null;
+				hasDownstream = false;
 
 				Throwable ex = error;
 				if (ex != null) {
@@ -295,15 +304,18 @@ public final class UnicastProcessor<T>
 		}
 	}
 
-	void drain() {
+	void drain(@Nullable T dataSignalOfferedBeforeDrain) {
 		if (WIP.getAndIncrement(this) != 0) {
+			if (dataSignalOfferedBeforeDrain != null && cancelled) {
+				Operators.onDiscard(dataSignalOfferedBeforeDrain, actual.currentContext());
+			}
 			return;
 		}
 
 		int missed = 1;
 
 		for (;;) {
-			Subscriber<? super T> a = actual;
+			CoreSubscriber<? super T> a = actual;
 			if (a != null) {
 
 				if (outputFused) {
@@ -321,15 +333,16 @@ public final class UnicastProcessor<T>
 		}
 	}
 
-	boolean checkTerminated(boolean d, boolean empty, Subscriber<? super T> a, Queue<T> q) {
+	boolean checkTerminated(boolean d, boolean empty, CoreSubscriber<? super T> a, Queue<T> q, @Nullable T t) {
 		if (cancelled) {
-			q.clear();
-			actual = null;
+			Operators.onDiscard(t, a.currentContext());
+			Operators.onDiscardQueueWithClear(q, a.currentContext(), null);
+			hasDownstream = false;
 			return true;
 		}
 		if (d && empty) {
 			Throwable e = error;
-			actual = null;
+			hasDownstream = false;
 			if (e != null) {
 				a.onError(e);
 			} else {
@@ -369,9 +382,10 @@ public final class UnicastProcessor<T>
 		}
 
 		if (!queue.offer(t)) {
+			Context ctx = actual.currentContext();
 			Throwable ex = Operators.onOperatorError(null,
-					Exceptions.failWithOverflow(), t, currentContext());
-			if(onOverflow != null) {
+					Exceptions.failWithOverflow(), t, ctx);
+			if (onOverflow != null) {
 				try {
 					onOverflow.accept(t);
 				}
@@ -380,10 +394,11 @@ public final class UnicastProcessor<T>
 					ex.initCause(e);
 				}
 			}
-			onError(Operators.onOperatorError(null, ex, t, currentContext()));
+			Operators.onDiscard(t, ctx);
+			onError(ex);
 			return;
 		}
-		drain();
+		drain(t);
 	}
 
 	@Override
@@ -398,7 +413,7 @@ public final class UnicastProcessor<T>
 
 		doTerminate();
 
-		drain();
+		drain(null);
 	}
 
 	@Override
@@ -411,7 +426,7 @@ public final class UnicastProcessor<T>
 
 		doTerminate();
 
-		drain();
+		drain(null);
 	}
 
 	@Override
@@ -419,12 +434,13 @@ public final class UnicastProcessor<T>
 		Objects.requireNonNull(actual, "subscribe");
 		if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
 
+			this.hasDownstream = true;
 			actual.onSubscribe(this);
 			this.actual = actual;
 			if (cancelled) {
-				this.actual = null;
+				this.hasDownstream = false;
 			} else {
-				drain();
+				drain(null);
 			}
 		} else {
 			Operators.error(actual, new IllegalStateException("UnicastProcessor " +
@@ -436,7 +452,7 @@ public final class UnicastProcessor<T>
 	public void request(long n) {
 		if (Operators.validate(n)) {
 			Operators.addCap(REQUESTED, this, n);
-			drain();
+			drain(null);
 		}
 	}
 
@@ -449,11 +465,13 @@ public final class UnicastProcessor<T>
 
 		doTerminate();
 
-		if (!outputFused) {
-			if (WIP.getAndIncrement(this) == 0) {
-				queue.clear();
-				actual = null;
+		if (WIP.getAndIncrement(this) == 0) {
+			if (!outputFused) {
+				// discard MUST be happening only and only if there is no racing on elements consumption
+				// which is guaranteed by the WIP guard here in case non-fused output
+				Operators.onDiscardQueueWithClear(queue, currentContext(), null);
 			}
+			hasDownstream = false;
 		}
 	}
 
@@ -475,7 +493,29 @@ public final class UnicastProcessor<T>
 
 	@Override
 	public void clear() {
-		queue.clear();
+		// use guard on the queue instance as the best way to ensure there is no racing on draining
+		// the call to this method must be done only during the ASYNC fusion so all the callers will be waiting
+		// this should not be performance costly with the assumption the cancel is rare operation
+		if (DISCARD_GUARD.getAndIncrement(this) != 0) {
+			return;
+		}
+
+		int missed = 1;
+
+		for (;;) {
+			Operators.onDiscardQueueWithClear(queue, currentContext(), null);
+
+			int dg = discardGuard;
+			if (missed == dg) {
+				missed = DISCARD_GUARD.addAndGet(this, -missed);
+				if (missed == 0) {
+					break;
+				}
+			}
+			else {
+				missed = dg;
+			}
+		}
 	}
 
 	@Override
@@ -515,6 +555,6 @@ public final class UnicastProcessor<T>
 
 	@Override
 	public boolean hasDownstreams() {
-		return actual != null;
+		return hasDownstream;
 	}
 }

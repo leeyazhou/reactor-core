@@ -49,6 +49,7 @@ import java.util.stream.Stream;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
@@ -59,7 +60,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Hooks;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Operators;
-import reactor.core.publisher.ParallelFlux;
 import reactor.core.publisher.Signal;
 import reactor.test.scheduler.VirtualTimeScheduler;
 import reactor.util.Logger;
@@ -598,6 +598,7 @@ final class DefaultStepVerifierBuilder<T>
 	}
 
 	@Override
+	@SuppressWarnings("deprecation") //the API-level is deprecated to discourage direct use as first step
 	public DefaultStepVerifierBuilder<T> expectNoEvent(Duration duration) {
 		Objects.requireNonNull(duration, "duration");
 		if(this.script.size() == 1 && this.script.get(0) == defaultFirstStep){
@@ -1129,10 +1130,11 @@ final class DefaultStepVerifierBuilder<T>
 					setFailure(null, "an unexpected Subscription has been received: %s; actual: cancelled",
 							subscription);
 				}
-				else {
-					setFailure(null, "an unexpected Subscription has been received: %s; actual: ",
+				// subscribeOrReturn may throw an exception after calling onSubscribe.
+				else if (!Operators.canAppearAfterOnSubscribe(subscription)) {
+					setFailure(null, "an unexpected Subscription has been received: %s; actual: %s",
 							subscription,
-							this);
+							this.get());
 				}
 			}
 		}

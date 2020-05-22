@@ -17,10 +17,13 @@
 package reactor.core.publisher;
 
 import java.time.Duration;
+import java.util.Collection;
+import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Spliterator;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -41,19 +44,20 @@ import java.util.stream.LongStream;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CorePublisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
 import reactor.core.Exceptions;
 import reactor.core.Fuseable;
+import reactor.core.Scannable;
 import reactor.core.publisher.FluxOnAssembly.AssemblyLightSnapshot;
 import reactor.core.publisher.FluxOnAssembly.AssemblySnapshot;
-import reactor.util.Metrics;
-import reactor.core.Scannable;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Scheduler.Worker;
 import reactor.core.scheduler.Schedulers;
 import reactor.util.Logger;
+import reactor.util.Metrics;
 import reactor.util.annotation.Nullable;
 import reactor.util.concurrent.Queues;
 import reactor.util.context.Context;
@@ -65,6 +69,7 @@ import reactor.util.function.Tuple6;
 import reactor.util.function.Tuple7;
 import reactor.util.function.Tuple8;
 import reactor.util.function.Tuples;
+import reactor.util.retry.Retry;
 
 /**
  * A Reactive Streams {@link Publisher} with basic rx operators that completes successfully by
@@ -315,15 +320,16 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	}
 
 	/**
-	 * Pick the first available result coming from any of the given monos and populate a new {@literal Mono}.
-	 *
+	 * Pick the first {@link Mono} to emit any signal (value, empty completion or error)
+	 * and replay that signal, effectively behaving like the fastest of these competing
+	 * sources.
 	 * <p>
 	 * <img class="marble" src="doc-files/marbles/firstForMono.svg" alt="">
 	 * <p>
-	 * @param monos The monos to use.
+	 * @param monos The deferred monos to use.
 	 * @param <T> The type of the function result.
 	 *
-	 * @return a {@link Mono}.
+	 * @return a new {@link Mono} behaving like the fastest of its sources.
 	 */
 	public static <T> Mono<T> first(Iterable<? extends Mono<? extends T>> monos) {
 		return onAssembly(new MonoFirst<>(monos));
@@ -335,12 +341,18 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * <p>
 	 * <img class="marble" src="doc-files/marbles/fromForMono.svg" alt="">
 	 * <p>
+	 * {@link Hooks#onEachOperator(String, Function)} and similar assembly hooks are applied
+	 * unless the source is already a {@link Mono} (including {@link Mono} that was decorated as a {@link Flux},
+	 * see {@link Flux#from(Publisher)}).
+	 *
 	 * @param source the {@link Publisher} source
 	 * @param <T> the source type
 	 *
 	 * @return the next item emitted as a {@link Mono}
 	 */
 	public static <T> Mono<T> from(Publisher<? extends T> source) {
+		//some sources can be considered already assembled monos
+		//all conversion methods (from, fromDirect, wrap) must accommodate for this
 		if (source instanceof Mono) {
 			@SuppressWarnings("unchecked")
 			Mono<T> casted = (Mono<T>) source;
@@ -354,12 +366,10 @@ public abstract class Mono<T> implements CorePublisher<T> {
 			Mono<T> extracted = (Mono<T>) wrapper.source;
 			return extracted;
 		}
-		if (source instanceof Flux) {
-			@SuppressWarnings("unchecked")
-			Flux<T> casted = (Flux<T>) source;
-			return casted.next();
-		}
-		return onAssembly(new MonoFromPublisher<>(source));
+
+		//we delegate to `wrap` and apply assembly hooks
+		@SuppressWarnings("unchecked") Publisher<T> downcasted = (Publisher<T>) source;
+		return onAssembly(wrap(downcasted, true));
 	}
 
 	/**
@@ -421,34 +431,40 @@ public abstract class Mono<T> implements CorePublisher<T> {
 
 	/**
 	 * Convert a {@link Publisher} to a {@link Mono} without any cardinality check
-	 * (ie this method doesn't check if the source is already a Mono, nor cancels the
-	 * source past the first element). Conversion supports {@link Fuseable} sources.
+	 * (ie this method doesn't cancel the source past the first element).
+	 * Conversion transparently returns {@link Mono} sources without wrapping and otherwise
+	 * supports {@link Fuseable} sources.
 	 * Note this is an advanced interoperability operator that implies you know the
 	 * {@link Publisher} you are converting follows the {@link Mono} semantics and only
 	 * ever emits one element.
+	 * <p>
+	 * {@link Hooks#onEachOperator(String, Function)} and similar assembly hooks are applied
+	 * unless the source is already a {@link Mono}.
 	 *
 	 * @param source the Mono-compatible {@link Publisher} to wrap
 	 * @param <I> type of the value emitted by the publisher
 	 * @return a wrapped {@link Mono}
 	 */
 	public static <I> Mono<I> fromDirect(Publisher<? extends I> source){
+		//some sources can be considered already assembled monos
+		//all conversion methods (from, fromDirect, wrap) must accommodate for this
 		if(source instanceof Mono){
 			@SuppressWarnings("unchecked")
 			Mono<I> m = (Mono<I>)source;
 			return m;
 		}
-		if(source instanceof Flux){
+		if (source instanceof FluxSourceMono
+				|| source instanceof FluxSourceMonoFuseable) {
 			@SuppressWarnings("unchecked")
-			Flux<I> f = (Flux<I>)source;
-			if(source instanceof Fuseable){
-				return onAssembly(new MonoSourceFluxFuseable<>(f));
-			}
-			return onAssembly(new MonoSourceFlux<>(f));
+			FluxFromMonoOperator<I, I> wrapper = (FluxFromMonoOperator<I,I>) source;
+			@SuppressWarnings("unchecked")
+			Mono<I> extracted = (Mono<I>) wrapper.source;
+			return extracted;
 		}
-		if(source instanceof Fuseable){
-			return onAssembly(new MonoSourceFuseable<>(source));
-		}
-		return onAssembly(new MonoSource<>(source));
+
+		//we delegate to `wrap` and apply assembly hooks
+		@SuppressWarnings("unchecked") Publisher<I> downcasted = (Publisher<I>) source;
+		return onAssembly(wrap(downcasted, false));
 	}
 
 	/**
@@ -1758,7 +1774,7 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @return a replaying {@link Mono}
 	 */
 	public final Mono<T> cache() {
-		return onAssembly(new MonoProcessor<>(this));
+		return onAssembly(new MonoCacheTime<>(this));
 	}
 
 	/**
@@ -2597,7 +2613,7 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * Recursively expand elements into a graph and emit all the resulting element using
 	 * a breadth-first traversal strategy.
 	 * <p>
-	 * That is: emit the value from this {@link Mono} first, then it each at a first level of
+	 * That is: emit the value from this {@link Mono} first, then expand it at a first level of
 	 * recursion and emit all of the resulting values, then expand all of these at a
 	 * second level and so on...
 	 * <p>
@@ -2637,7 +2653,7 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * Recursively expand elements into a graph and emit all the resulting element using
 	 * a breadth-first traversal strategy.
 	 * <p>
-	 * That is: emit the value from this {@link Mono} first, then it each at a first level of
+	 * That is: emit the value from this {@link Mono} first, then expand it at a first level of
 	 * recursion and emit all of the resulting values, then expand all of these at a
 	 * second level and so on...
 	 * <p>
@@ -2774,9 +2790,21 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * Transform the item emitted by this {@link Mono} into {@link Iterable}, then forward
 	 * its elements into the returned {@link Flux}. The prefetch argument allows to
 	 * give an arbitrary prefetch size to the inner {@link Iterable}.
+	 * The {@link Iterable#iterator()} method will be called at least once and at most twice.
 	 *
 	 * <p>
 	 * <img class="marble" src="doc-files/marbles/flatMapIterableForMono.svg" alt="">
+	 * <p>
+	 * This operator inspects each {@link Iterable}'s {@link Spliterator} to assess if the iteration
+	 * can be guaranteed to be finite (see {@link Operators#onDiscardMultiple(Iterator, boolean, Context)}).
+	 * Since the default Spliterator wraps the Iterator we can have two {@link Iterable#iterator()}
+	 * calls per iterable. This second invocation is skipped on a {@link Collection } however, a type which is
+	 * assumed to be always finite.
+	 *
+	 * @reactor.discard Upon cancellation, this operator discards {@code T} elements it prefetched and, in
+	 * some cases, attempts to discard remainder of the currently processed {@link Iterable} (if it can
+	 * safely ensure the iterator is finite). Note that this means each {@link Iterable}'s {@link Iterable#iterator()}
+	 * method could be invoked twice.
 	 *
 	 * @param mapper the {@link Function} to transform input item into a sequence {@link Iterable}
 	 * @param <R> the merged output sequence type
@@ -2795,24 +2823,11 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @return a {@link Flux} variant of this {@link Mono}
 	 */
     public final Flux<T> flux() {
-	    if (this instanceof Callable) {
-	        if (this instanceof Fuseable.ScalarCallable) {
-		        T v;
-		        try {
-			        v = block();
-		        }
-		        catch (Throwable t) {
-			        return Flux.error(Exceptions.unwrap(t));
-		        }
-	            if (v == null) {
-	                return Flux.empty();
-	            }
-	            return Flux.just(v);
-	        }
+	    if (this instanceof Callable && !(this instanceof Fuseable.ScalarCallable)) {
 		    @SuppressWarnings("unchecked") Callable<T> thiz = (Callable<T>) this;
 		    return Flux.onAssembly(new FluxCallable<>(thiz));
 	    }
-		return Flux.wrap(this);
+		return Flux.from(this);
 	}
 
 	/**
@@ -3105,12 +3120,12 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	}
 
 	/**
-	 * Emit the first available result from this mono or the other mono.
+	 * Emit the first available signal from this mono or the other mono.
 	 *
 	 * <p>
 	 * <img class="marble" src="doc-files/marbles/orForMono.svg" alt="">
 	 *
-	 * @param other the racing other {@link Mono} to compete with for the result
+	 * @param other the racing other {@link Mono} to compete with for the signal
 	 *
 	 * @return a new {@link Mono}
 	 * @see #first
@@ -3646,7 +3661,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @param retryMatcher the predicate to evaluate if retry should occur based on a given error signal
 	 *
 	 * @return a {@link Mono} that retries on onError if the predicates matches.
+	 * @deprecated use {@link #retryWhen(Retry)} instead, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retry(Predicate<? super Throwable> retryMatcher) {
 		return onAssembly(new MonoRetryPredicate<>(this, retryMatcher));
 	}
@@ -3663,8 +3680,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 *
 	 * @return a {@link Mono} that retries on onError up to the specified number of retry
 	 * attempts, only if the predicate matches.
-	 *
+	 * @deprecated use {@link #retryWhen(Retry)} instead, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retry(long numRetries, Predicate<? super Throwable> retryMatcher) {
 		return defer(() -> retry(Flux.countingPredicate(retryMatcher, numRetries)));
 	}
@@ -3681,16 +3699,96 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * <p>
 	 * Note that if the companion {@link Publisher} created by the {@code whenFactory}
 	 * emits {@link Context} as trigger objects, the content of these Context will be added
-	 * to the operator's own {@link Context}.
+	 * to the operator's own {@link Context}:
+	 * <blockquote>
+	 * <pre>
+	 * {@code
+	 * Function<Flux<Throwable>, Publisher<?>> customFunction = errorCurrentAttempt -> errorCurrentAttempt.handle((lastError, sink) -> {
+	 * 	    Context ctx = sink.currentContext();
+	 * 	    int rl = ctx.getOrDefault("retriesLeft", 0);
+	 * 	    if (rl > 0) {
+	 *		    sink.next(Context.of(
+	 *		        "retriesLeft", rl - 1,
+	 *		        "lastError", lastError
+	 *		    ));
+	 * 	    } else {
+	 * 	        sink.error(Exceptions.retryExhausted("retries exhausted", lastError));
+	 * 	    }
+	 * });
+	 * Mono<T> retried = originalMono.retryWhen(customFunction);
+	 * }</pre>
+	 * </blockquote>
 	 *
 	 * @param whenFactory the {@link Function} that returns the associated {@link Publisher}
 	 * companion, given a {@link Flux} that signals each onError as a {@link Throwable}.
 	 *
 	 * @return a {@link Mono} that retries on onError when the companion {@link Publisher} produces an
 	 * onNext signal
+	 * @deprecated use {@link #retryWhen(Retry)} instead, to be removed in 3.4. Lambda Functions that don't make
+	 * use of the error can simply be converted by wrapping via {@link Retry#from(Function)}.
+	 * Functions that do use the error will additionally need to map the {@link reactor.util.retry.Retry.RetrySignal}
+	 * emitted by the companion to its {@link Retry.RetrySignal#failure()}.
 	 */
+	@Deprecated
 	public final Mono<T> retryWhen(Function<Flux<Throwable>, ? extends Publisher<?>> whenFactory) {
-		return onAssembly(new MonoRetryWhen<>(this, whenFactory));
+		Objects.requireNonNull(whenFactory, "whenFactory");
+		return onAssembly(new MonoRetryWhen<>(this, Retry.from(rws -> whenFactory.apply(rws.map(
+				Retry.RetrySignal::failure)))));
+	}
+
+	/**
+	 * Retries this {@link Mono} in response to signals emitted by a companion {@link Publisher}.
+	 * The companion is generated by the provided {@link Retry} instance, see {@link Retry#max(long)}, {@link Retry#maxInARow(long)}
+	 * and {@link Retry#backoff(long, Duration)} for readily available strategy builders.
+	 * <p>
+	 * The operator generates a base for the companion, a {@link Flux} of {@link reactor.util.retry.Retry.RetrySignal}
+	 * which each give metadata about each retryable failure whenever this {@link Mono} signals an error. The final companion
+	 * should be derived from that base companion and emit data in response to incoming onNext (although it can emit less
+	 * elements, or delay the emissions).
+	 * <p>
+	 * Terminal signals in the companion terminate the sequence with the same signal, so emitting an {@link Subscriber#onError(Throwable)}
+	 * will fail the resulting {@link Mono} with that same error.
+	 * <p>
+	 * <img class="marble" src="doc-files/marbles/retryWhenSpecForMono.svg" alt="">
+	 * <p>
+	 * Note that the {@link Retry.RetrySignal} state can be transient and change between each source
+	 * {@link org.reactivestreams.Subscriber#onError(Throwable) onError} or
+	 * {@link org.reactivestreams.Subscriber#onNext(Object) onNext}. If processed with a delay,
+	 * this could lead to the represented state being out of sync with the state at which the retry
+	 * was evaluated. Map it to {@link Retry.RetrySignal#copy()} right away to mediate this.
+	 * <p>
+	 * Note that if the companion {@link Publisher} created by the {@code whenFactory}
+	 * emits {@link Context} as trigger objects, these {@link Context} will be merged with
+	 * the previous Context:
+	 * <blockquote>
+	 * <pre>
+	 * {@code
+	 * Retry customStrategy = Retry.fromFunction(companion -> companion.handle((retrySignal, sink) -> {
+	 * 	    Context ctx = sink.currentContext();
+	 * 	    int rl = ctx.getOrDefault("retriesLeft", 0);
+	 * 	    if (rl > 0) {
+	 *		    sink.next(Context.of(
+	 *		        "retriesLeft", rl - 1,
+	 *		        "lastError", retrySignal.failure()
+	 *		    ));
+	 * 	    } else {
+	 * 	        sink.error(Exceptions.retryExhausted("retries exhausted", retrySignal.failure()));
+	 * 	    }
+	 * }));
+	 * Mono<T> retried = originalMono.retryWhen(customStrategy);
+	 * }</pre>
+	 * </blockquote>
+	 *
+	 * @param retrySpec the {@link Retry} strategy that will generate the companion {@link Publisher},
+	 * given a {@link Flux} that signals each onError as a {@link reactor.util.retry.Retry.RetrySignal}.
+	 *
+	 * @return a {@link Mono} that retries on onError when a companion {@link Publisher} produces an onNext signal
+	 * @see Retry#max(long)
+	 * @see Retry#maxInARow(long)
+	 * @see Retry#backoff(long, Duration)
+	 */
+	public final Mono<T> retryWhen(Retry retrySpec) {
+		return onAssembly(new MonoRetryWhen<>(this, retrySpec));
 	}
 
 	/**
@@ -3722,9 +3820,11 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @param firstBackoff the first backoff delay to apply then grow exponentially. Also
 	 * minimum delay even taking jitter into account.
 	 * @return a {@link Mono} that retries on onError with exponentially growing randomized delays between retries.
+	 * @deprecated use {@link #retryWhen(Retry)} with a {@link Retry#backoff(long, Duration)} base, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retryBackoff(long numRetries, Duration firstBackoff) {
-		return retryBackoff(numRetries, firstBackoff, Duration.ofMillis(Long.MAX_VALUE), 0.5d);
+		return retryWhen(Retry.backoff(numRetries, firstBackoff));
 	}
 
 	/**
@@ -3758,7 +3858,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * minimum delay even taking jitter into account.
 	 * @param maxBackoff the maximum delay to apply despite exponential growth and jitter.
 	 * @return a {@link Mono} that retries on onError with exponentially growing randomized delays between retries.
+	 * @deprecated use {@link #retryWhen(Retry)} with a {@link Retry#backoff(long, Duration)} base, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retryBackoff(long numRetries, Duration firstBackoff, Duration maxBackoff) {
 		return retryBackoff(numRetries, firstBackoff, maxBackoff, 0.5d);
 	}
@@ -3796,7 +3898,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @param maxBackoff the maximum delay to apply despite exponential growth and jitter.
 	 * @param backoffScheduler the {@link Scheduler} on which the delays and subsequent attempts are executed.
 	 * @return a {@link Mono} that retries on onError with exponentially growing randomized delays between retries.
+	 * @deprecated use {@link #retryWhen(Retry)} with a {@link Retry#backoff(long, Duration)} base, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retryBackoff(long numRetries, Duration firstBackoff, Duration maxBackoff, Scheduler backoffScheduler) {
 		return retryBackoff(numRetries, firstBackoff, maxBackoff, 0.5d, backoffScheduler);
 	}
@@ -3834,7 +3938,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @param maxBackoff the maximum delay to apply despite exponential growth and jitter.
 	 * @param jitterFactor the jitter percentage (as a double between 0.0 and 1.0).
 	 * @return a {@link Mono} that retries on onError with exponentially growing randomized delays between retries.
+	 * @deprecated use {@link #retryWhen(Retry)} with a {@link Retry#backoff(long, Duration)} base, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retryBackoff(long numRetries, Duration firstBackoff, Duration maxBackoff, double jitterFactor) {
 		return retryBackoff(numRetries, firstBackoff, maxBackoff, jitterFactor, Schedulers.parallel());
 	}
@@ -3875,9 +3981,16 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @param backoffScheduler the {@link Scheduler} on which the delays and subsequent attempts are executed.
 	 * @param jitterFactor the jitter percentage (as a double between 0.0 and 1.0).
 	 * @return a {@link Mono} that retries on onError with exponentially growing randomized delays between retries.
+	 * @deprecated use {@link #retryWhen(Retry)} with a {@link Retry#backoff(long, Duration)} base, to be removed in 3.4
 	 */
+	@Deprecated
 	public final Mono<T> retryBackoff(long numRetries, Duration firstBackoff, Duration maxBackoff, double jitterFactor, Scheduler backoffScheduler) {
-		return retryWhen(FluxRetryWhen.randomExponentialBackoffFunction(numRetries, firstBackoff, maxBackoff, jitterFactor, backoffScheduler));
+		return retryWhen(Retry
+				.backoff(numRetries, firstBackoff)
+				.maxBackoff(maxBackoff)
+				.jitter(jitterFactor)
+				.scheduler(backoffScheduler)
+				.transientErrors(false));
 	}
 
 	/**
@@ -4084,25 +4197,31 @@ public abstract class Mono<T> implements CorePublisher<T> {
 		CorePublisher publisher = Operators.onLastAssembly(this);
 		CoreSubscriber subscriber = Operators.toCoreSubscriber(actual);
 
-		if (publisher instanceof OptimizableOperator) {
-			OptimizableOperator operator = (OptimizableOperator) publisher;
-			while (true) {
-				subscriber = operator.subscribeOrReturn(subscriber);
-				if (subscriber == null) {
-					// null means "I will subscribe myself", returning...
-					return;
-				}
+		try {
+			if (publisher instanceof OptimizableOperator) {
+				OptimizableOperator operator = (OptimizableOperator) publisher;
+				while (true) {
+					subscriber = operator.subscribeOrReturn(subscriber);
+					if (subscriber == null) {
+						// null means "I will subscribe myself", returning...
+						return;
+					}
 
-				OptimizableOperator newSource = operator.nextOptimizableSource();
-				if (newSource == null) {
-					publisher = operator.source();
-					break;
+					OptimizableOperator newSource = operator.nextOptimizableSource();
+					if (newSource == null) {
+						publisher = operator.source();
+						break;
+					}
+					operator = newSource;
 				}
-				operator = newSource;
 			}
-		}
 
-		publisher.subscribe(subscriber);
+			publisher.subscribe(subscriber);
+		}
+		catch (Throwable e) {
+			Operators.reportThrowInSubscribe(subscriber, e);
+			return;
+		}
 	}
 
 	/**
@@ -4542,7 +4661,7 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @return a {@link CompletableFuture}
 	 */
 	public final CompletableFuture<T> toFuture() {
-		return subscribeWith(new MonoToCompletableFuture<>());
+		return subscribeWith(new MonoToCompletableFuture<>(false));
 	}
 
 	/**
@@ -4584,9 +4703,9 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @see #transformDeferred(Function) transformDeferred(Function) for deferred composition of {@link Mono} for each {@link Subscriber}
 	 * @see #as(Function) as(Function) for a loose conversion to an arbitrary type
 	 */
+	@SuppressWarnings({"unchecked", "rawtypes"})
 	public final <V> Mono<V> transform(Function<? super Mono<T>, ? extends Publisher<V>> transformer) {
 		if (Hooks.DETECT_CONTEXT_LOSS) {
-			//noinspection unchecked,rawtypes
 			transformer = new ContextTrackingFunctionWrapper(transformer);
 		}
 		return onAssembly(from(transformer.apply(this)));
@@ -4611,10 +4730,10 @@ public abstract class Mono<T> implements CorePublisher<T> {
 	 * @see #as as() for a loose conversion to an arbitrary type
 	 * @see #transform(Function)
 	 */
+	@SuppressWarnings({"unchecked", "rawtypes"})
 	public final <V> Mono<V> transformDeferred(Function<? super Mono<T>, ? extends Publisher<V>> transformer) {
 		return defer(() -> {
 			if (Hooks.DETECT_CONTEXT_LOSS) {
-				//noinspection unchecked,rawtypes
 				return from(new ContextTrackingFunctionWrapper<T, V>((Function) transformer).apply(this));
 			}
 			return from(transformer.apply(this));
@@ -4790,6 +4909,57 @@ public abstract class Mono<T> implements CorePublisher<T> {
 			@Nullable Consumer<? super Throwable> onError,
 			@Nullable BiConsumer<? super T, Throwable> onAfterTerminate) {
 		return onAssembly(new MonoPeekTerminal<>(source, onSuccess, onError, onAfterTerminate));
+	}
+
+	/**
+	 * Unchecked wrap of {@link Publisher} as {@link Mono}, supporting {@link Fuseable} sources.
+	 * When converting a {@link Mono} or {@link Mono Monos} that have been converted to a {@link Flux} and back,
+	 * the original {@link Mono} is returned unwrapped.
+	 * Note that this bypasses {@link Hooks#onEachOperator(String, Function) assembly hooks}.
+	 *
+	 * @param source the {@link Publisher} to wrap
+	 * @param enforceMonoContract {@code} true to wrap publishers without assumption about their cardinality
+	 * (first {@link Subscriber#onNext(Object)} will cancel the source), {@code false} to behave like {@link #fromDirect(Publisher)}.
+	 * @param <T> input upstream type
+	 * @return a wrapped {@link Mono}
+	 */
+	static <T> Mono<T> wrap(Publisher<T> source, boolean enforceMonoContract) {
+		//some sources can be considered already assembled monos
+		//all conversion methods (from, fromDirect, wrap) must accommodate for this
+		if (source instanceof Mono) {
+			return (Mono<T>) source;
+		}
+		if (source instanceof FluxSourceMono
+				|| source instanceof FluxSourceMonoFuseable) {
+			FluxFromMonoOperator<T, T> wrapper = (FluxFromMonoOperator<T,T>) source;
+			@SuppressWarnings("unchecked")
+			Mono<T> extracted = (Mono<T>) wrapper.source;
+			return extracted;
+		}
+
+		//equivalent to what from used to be, without assembly hooks
+		if (enforceMonoContract) {
+			if (source instanceof Flux && source instanceof Callable) {
+					@SuppressWarnings("unchecked") Callable<T> m = (Callable<T>) source;
+					return Flux.wrapToMono(m);
+			}
+			if (source instanceof Flux) {
+				return new MonoNext<>((Flux<T>) source);
+			}
+			return new MonoFromPublisher<>(source);
+		}
+
+		//equivalent to what fromDirect used to be without onAssembly
+		if(source instanceof Flux && source instanceof Fuseable) {
+			return new MonoSourceFluxFuseable<>((Flux<T>) source);
+		}
+		if (source instanceof Flux) {
+			return new MonoSourceFlux<>((Flux<T>) source);
+		}
+		if(source instanceof Fuseable) {
+			return new MonoSourceFuseable<>(source);
+		}
+		return new MonoSource<>(source);
 	}
 
 	@SuppressWarnings("unchecked")

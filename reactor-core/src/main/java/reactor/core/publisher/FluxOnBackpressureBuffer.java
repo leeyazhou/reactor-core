@@ -85,11 +85,19 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 		Throwable error;
 
 		volatile int wip;
+		@SuppressWarnings("rawtypes")
 		static final AtomicIntegerFieldUpdater<BackpressureBufferSubscriber> WIP =
 				AtomicIntegerFieldUpdater.newUpdater(BackpressureBufferSubscriber.class,
 						"wip");
 
+		volatile int discardGuard;
+		@SuppressWarnings("rawtypes")
+		static final AtomicIntegerFieldUpdater<BackpressureBufferSubscriber> DISCARD_GUARD =
+				AtomicIntegerFieldUpdater.newUpdater(BackpressureBufferSubscriber.class,
+						"discardGuard");
+
 		volatile long requested;
+		@SuppressWarnings("rawtypes")
 		static final AtomicLongFieldUpdater<BackpressureBufferSubscriber> REQUESTED =
 				AtomicLongFieldUpdater.newUpdater(BackpressureBufferSubscriber.class,
 						"requested");
@@ -154,6 +162,10 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 				Operators.onNextDropped(t, ctx);
 				return;
 			}
+			if (cancelled) {
+				Operators.onDiscard(t, ctx);
+			}
+
 			if ((capacityOrSkip != Integer.MAX_VALUE && queue.size() >= capacityOrSkip) || !queue.offer(t)) {
 				Throwable ex = Operators.onOperatorError(s, Exceptions.failWithOverflow(), t, ctx);
 				if (onOverflow != null) {
@@ -169,7 +181,7 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 				onError(ex);
 				return;
 			}
-			drain();
+			drain(t);
 		}
 
 		@Override
@@ -180,7 +192,7 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 			}
 			error = t;
 			done = true;
-			drain();
+			drain(null);
 		}
 
 		@Override
@@ -189,11 +201,14 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 				return;
 			}
 			done = true;
-			drain();
+			drain(null);
 		}
 
-		void drain() {
+		void drain(@Nullable T dataSignal) {
 			if (WIP.getAndIncrement(this) != 0) {
+				if (dataSignal != null && cancelled) {
+					Operators.onDiscard(dataSignal, actual.currentContext());
+				}
 				return;
 			}
 
@@ -235,7 +250,7 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 					T t = q.poll();
 					boolean empty = t == null;
 
-					if (checkTerminated(d, empty, a)) {
+					if (checkTerminated(d, empty, a, t)) {
 						return;
 					}
 
@@ -249,7 +264,7 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 				}
 
 				if (r == e) {
-					if (checkTerminated(done, q.isEmpty(), a)) {
+					if (checkTerminated(done, q.isEmpty(), a, null)) {
 						return;
 					}
 				}
@@ -273,8 +288,9 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 			for (; ; ) {
 
 				if (cancelled) {
-					s.cancel();
-					Operators.onDiscardQueueWithClear(q, ctx, null);
+					// We are the holder of the queue, but we still have to perform discarding under the guarded block
+					// to prevent any racing done by downstream
+					this.clear();
 					return;
 				}
 
@@ -304,7 +320,7 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 		public void request(long n) {
 			if (Operators.validate(n)) {
 				Operators.addCap(REQUESTED, this, n);
-				drain();
+				drain(null);
 			}
 		}
 
@@ -315,8 +331,10 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 
 				s.cancel();
 
-				if (!enabledFusion) {
-					if (WIP.getAndIncrement(this) == 0) {
+				if (WIP.getAndIncrement(this) == 0) {
+					if (!enabledFusion) {
+						// discard MUST be happening only and only if there is no racing on elements consumption
+						// which is guaranteed by the WIP guard here in case non-fused output
 						Operators.onDiscardQueueWithClear(queue, ctx, null);
 					}
 				}
@@ -341,7 +359,29 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 
 		@Override
 		public void clear() {
-			Operators.onDiscardQueueWithClear(queue, ctx, null);
+			// use guard on the queue instance as the best way to ensure there is no racing on draining
+			// the call to this method must be done only during the ASYNC fusion so all the callers will be waiting
+			// this should not be performance costly with the assumption the cancel is rare operation
+			if (DISCARD_GUARD.getAndIncrement(this) != 0) {
+				return;
+			}
+
+			int missed = 1;
+
+			for (;;) {
+				Operators.onDiscardQueueWithClear(queue, ctx, null);
+
+				int dg = discardGuard;
+				if (missed == dg) {
+					missed = DISCARD_GUARD.addAndGet(this, -missed);
+					if (missed == 0) {
+						break;
+					}
+				}
+				else {
+					missed = dg;
+				}
+			}
 		}
 
 		@Override
@@ -358,9 +398,10 @@ final class FluxOnBackpressureBuffer<O> extends InternalFluxOperator<O, O> imple
 			return actual;
 		}
 
-		boolean checkTerminated(boolean d, boolean empty, Subscriber<? super T> a) {
+		boolean checkTerminated(boolean d, boolean empty, Subscriber<? super T> a, @Nullable T v) {
 			if (cancelled) {
 				s.cancel();
+				Operators.onDiscard(v, ctx);
 				Operators.onDiscardQueueWithClear(queue, ctx, null);
 				return true;
 			}

@@ -49,7 +49,7 @@ final class ConnectableLiftFuseable<I, O> extends InternalConnectableFluxOperato
 
 	@Override
 	public void connect(Consumer<? super Disposable> cancelSupport) {
-		this.source.connect();
+		this.source.connect(cancelSupport);
 	}
 
 	@Override
@@ -58,6 +58,14 @@ final class ConnectableLiftFuseable<I, O> extends InternalConnectableFluxOperato
 		if (key == Attr.PREFETCH) return source.getPrefetch();
 		if (key == Attr.PARENT) return source;
 		return null;
+	}
+
+	@Override
+	public String stepName() {
+		if (source instanceof Scannable) {
+			return Scannable.from(source).stepName();
+		}
+		return super.stepName();
 	}
 
 	@Override

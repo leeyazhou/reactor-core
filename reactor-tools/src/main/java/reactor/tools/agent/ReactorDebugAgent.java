@@ -23,23 +23,42 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 import net.bytebuddy.agent.ByteBuddyAgent;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassVisitor;
-import org.objectweb.asm.ClassWriter;
-import org.objectweb.asm.MethodVisitor;
-import org.objectweb.asm.Opcodes;
-import org.objectweb.asm.Type;
+import net.bytebuddy.jar.asm.ClassReader;
+import net.bytebuddy.jar.asm.ClassVisitor;
+import net.bytebuddy.jar.asm.ClassWriter;
 
 public class ReactorDebugAgent {
 
+	private static final String INSTALLED_PROPERTY = "reactor.tools.agent.installed";
+
 	private static Instrumentation instrumentation;
 
+	/**
+	 * This method is a part of the Java Agent contract and should not be
+	 * used directly.
+	 *
+	 * @deprecated to discourage the usage from user's code
+	 */
+	@Deprecated
+	public static void premain(String args, Instrumentation instrumentation) {
+		instrument(instrumentation);
+		System.setProperty(INSTALLED_PROPERTY, "true");
+	}
+
 	public static synchronized void init() {
+		if (System.getProperty(INSTALLED_PROPERTY) != null) {
+			return;
+		}
+
 		if (instrumentation != null) {
 			return;
 		}
 		instrumentation = ByteBuddyAgent.install();
 
+		instrument(instrumentation);
+	}
+
+	private static void instrument(Instrumentation instrumentation) {
 		ClassFileTransformer transformer = new ClassFileTransformer() {
 			@Override
 			public byte[] transform(
@@ -79,46 +98,7 @@ public class ReactorDebugAgent {
 				ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS);
 
 				AtomicBoolean changed = new AtomicBoolean();
-				ClassVisitor classVisitor = new ClassVisitor(Opcodes.ASM7, cw) {
-
-					private String currentClassName = "";
-
-					private String currentSource = "";
-
-					@Override
-					public void visitSource(String source, String debug) {
-						super.visitSource(source, debug);
-						currentSource = source;
-					}
-
-					@Override
-					public void visit(int version, int access, String name, String signature, String superName, String[] interfaces) {
-						super.visit(version, access, name, signature, superName, interfaces);
-						currentClassName = name;
-					}
-
-					@Override
-					public MethodVisitor visitMethod(int access, String currentMethod, String descriptor, String signature, String[] exceptions) {
-						MethodVisitor visitor = super.visitMethod(access, currentMethod, descriptor, signature, exceptions);
-
-						if (currentClassName.contains("CGLIB$$")) {
-							return visitor;
-						}
-
-						String returnType = Type.getReturnType(descriptor).getInternalName();
-						switch (returnType) {
-							// Handle every core publisher type.
-							// Note that classes like `GroupedFlux` or `ConnectableFlux` are not included,
-							// because they don't have a type-preserving "checkpoint" method
-							case "reactor/core/publisher/Flux":
-							case "reactor/core/publisher/Mono":
-							case "reactor/core/publisher/ParallelFlux":
-								visitor = new ReturnHandlingMethodVisitor(visitor, returnType, currentClassName, currentMethod, currentSource, changed);
-						}
-
-						return new CallSiteInfoAddingMethodVisitor(visitor, currentClassName, currentMethod, currentSource, changed);
-					}
-				};
+				ClassVisitor classVisitor = new ReactorDebugClassVisitor(cw, changed);
 
 				try {
 					cr.accept(classVisitor, 0);
@@ -140,6 +120,11 @@ public class ReactorDebugAgent {
 	}
 
 	public static synchronized void processExistingClasses() {
+		if (System.getProperty(INSTALLED_PROPERTY) != null) {
+			// processExistingClasses is a NOOP when running as an agent
+			return;
+		}
+
 		if (instrumentation == null) {
 			throw new IllegalStateException("Must be initialized first!");
 		}

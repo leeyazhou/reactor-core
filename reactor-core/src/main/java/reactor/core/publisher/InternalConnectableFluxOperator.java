@@ -36,31 +36,44 @@ abstract class InternalConnectableFluxOperator<I, O> extends ConnectableFlux<O> 
 	 */
 	public InternalConnectableFluxOperator(ConnectableFlux<I> source) {
 		this.source = source;
-		this.optimizableOperator = source instanceof OptimizableOperator ? (OptimizableOperator) source : null;
+		if (source instanceof OptimizableOperator) {
+			@SuppressWarnings("unchecked")
+			OptimizableOperator<?, I> optimSource = (OptimizableOperator<?, I>) source;
+			this.optimizableOperator = optimSource;
+		}
+		else {
+			this.optimizableOperator = null;
+		}
 	}
 
 	@Override
 	@SuppressWarnings("unchecked")
 	public final void subscribe(CoreSubscriber<? super O> subscriber) {
 		OptimizableOperator operator = this;
-		while (true) {
-			subscriber = operator.subscribeOrReturn(subscriber);
-			if (subscriber == null) {
-				// null means "I will subscribe myself", returning...
-				return;
+		try {
+			while (true) {
+				subscriber = operator.subscribeOrReturn(subscriber);
+				if (subscriber == null) {
+					// null means "I will subscribe myself", returning...
+					return;
+				}
+				OptimizableOperator newSource = operator.nextOptimizableSource();
+				if (newSource == null) {
+					operator.source().subscribe(subscriber);
+					return;
+				}
+				operator = newSource;
 			}
-			OptimizableOperator newSource = operator.nextOptimizableSource();
-			if (newSource == null) {
-				operator.source().subscribe(subscriber);
-				return;
-			}
-			operator = newSource;
+		}
+		catch (Throwable e) {
+			Operators.reportThrowInSubscribe(subscriber, e);
+			return;
 		}
 	}
 
 	@Override
 	@Nullable
-	public abstract CoreSubscriber<? super I> subscribeOrReturn(CoreSubscriber<? super O> actual);
+	public abstract CoreSubscriber<? super I> subscribeOrReturn(CoreSubscriber<? super O> actual) throws Throwable;
 
 	@Override
 	public final CorePublisher<? extends I> source() {

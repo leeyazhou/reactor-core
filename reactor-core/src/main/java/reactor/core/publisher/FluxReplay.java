@@ -28,6 +28,7 @@ import java.util.stream.Stream;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CorePublisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
@@ -67,6 +68,8 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 
 		@Nullable
 		Object node();
+
+		long signalConnectAndGetRequested();
 
 		int tailIndex();
 
@@ -920,6 +923,11 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 			Node(@Nullable T value) {
 				this.value = value;
 			}
+
+			@Override
+			public String toString() {
+				return "Node(" + value + ")";
+			}
 		}
 
 		@Override
@@ -1001,7 +1009,14 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 			long ttl,
 			@Nullable Scheduler scheduler) {
 		this.source = Objects.requireNonNull(source, "source");
-		this.optimizableOperator = source instanceof OptimizableOperator ? (OptimizableOperator) source : null;
+		if (source instanceof OptimizableOperator) {
+			@SuppressWarnings("unchecked")
+			OptimizableOperator<?, T> optimSource = (OptimizableOperator<?, T>) source;
+			this.optimizableOperator = optimSource;
+		}
+		else {
+			this.optimizableOperator = null;
+		}
 		this.history = history;
 		if(history < 0){
 			throw new IllegalArgumentException("History cannot be negative : " + history);
@@ -1054,22 +1069,34 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 
 		cancelSupport.accept(s);
 		if (doConnect) {
-			source.subscribe(s);
+			try {
+				source.subscribe(s);
+			}
+			catch (Throwable e) {
+				Operators.reportThrowInSubscribe(connection, e);
+				return;
+			}
 		}
 	}
 
 	@Override
 	@SuppressWarnings("unchecked")
 	public void subscribe(CoreSubscriber<? super T> actual) {
-		CoreSubscriber nextSubscriber = subscribeOrReturn(actual);
-		if (nextSubscriber == null) {
+		try {
+			CoreSubscriber nextSubscriber = subscribeOrReturn(actual);
+			if (nextSubscriber == null) {
+				return;
+			}
+			source.subscribe(nextSubscriber);
+		}
+		catch (Throwable e) {
+			Operators.error(actual, Operators.onOperatorError(e, actual.currentContext()));
 			return;
 		}
-		source.subscribe(nextSubscriber);
 	}
 
 	@Override
-	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) {
+	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) throws Throwable {
 		boolean expired;
 		for (; ; ) {
 			ReplaySubscriber<T> c = connection;
@@ -1083,7 +1110,7 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 				c = u;
 			}
 
-			ReplayInner<T> inner = new ReplayInner<>(actual);
+			ReplayInner<T> inner = new ReplayInner<>(actual, c, ReplaySubscriber.CONNECTED.get(c) == 0);
 			actual.onSubscribe(inner);
 			c.add(inner);
 
@@ -1092,7 +1119,6 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 				return null;
 			}
 
-			inner.parent = c;
 			c.buffer.replay(inner);
 
 			if (expired) {
@@ -1155,6 +1181,7 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 		static final ReplaySubscription[] TERMINATED = new ReplaySubscription[0];
 
 		volatile boolean cancelled;
+		volatile boolean unbounded;
 
 		@SuppressWarnings("unchecked")
 		ReplaySubscriber(ReplayBuffer<T> buffer,
@@ -1170,12 +1197,39 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 				s.cancel();
 			}
 			else if (Operators.setOnce(S, this, s)) {
+				ReplaySubscription<T>[] subs = subscribers;
+				//first check if there are no early subscribers,
+				// in which case we fallback to old UNBOUNDED behavior
+				if (subs.length == 0) {
+					unbounded = true;
+					s.request(Long.MAX_VALUE);
+					return;
+				}
+				//otherwise check each early subscriber. if fused or unbounded request,
+				// also fallback to UNBOUNDED behavior. Apply a minimum of `parent.history`
 				long max = parent.history;
 				for (ReplaySubscription<T> subscriber : subscribers) {
-					max = Math.max(subscriber.fusionMode() != Fuseable.NONE ? Long.MAX_VALUE : subscriber.requested(), max);
-					if (max == Long.MAX_VALUE) break;
+					max = Math.max(subscriber.fusionMode() != Fuseable.NONE ? Long.MAX_VALUE : subscriber.signalConnectAndGetRequested(), max);
+					if (max == Long.MAX_VALUE) {
+						unbounded = true;
+						break;
+					}
 				}
 				s.request(max);
+			}
+		}
+
+		void propagateRequest(long n) {
+			Subscription s = S.get(this);
+			if (!unbounded && s != null) {
+				if (n == Long.MAX_VALUE) {
+					unbounded = true;
+					s.request(n);
+				}
+				else {
+					//TODO find a way to avoid requesting if a competing early subscriber did already request?
+					s.request(n);
+				}
 			}
 		}
 
@@ -1357,8 +1411,7 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 			implements ReplaySubscription<T> {
 
 		final CoreSubscriber<? super T> actual;
-
-		ReplaySubscriber<T> parent;
+		final ReplaySubscriber<T>       parent;
 
 		int index;
 
@@ -1379,21 +1432,35 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 		static final AtomicLongFieldUpdater<ReplayInner> REQUESTED =
 				AtomicLongFieldUpdater.newUpdater(ReplayInner.class, "requested");
 
+		volatile int state;
+		@SuppressWarnings("rawtypes")
+		static final AtomicIntegerFieldUpdater<ReplayInner> STATE = AtomicIntegerFieldUpdater.newUpdater(ReplayInner.class, "state");
 
-		ReplayInner(CoreSubscriber<? super T> actual) {
+
+		ReplayInner(CoreSubscriber<? super T> actual, ReplaySubscriber<T> parent, boolean registeredBeforeConnection) {
 			this.actual = actual;
+			this.parent = parent;
+			this.state = registeredBeforeConnection ? STATE_EARLY_ACCUMULATE : STATE_LATE;
 		}
+
+		static final int STATE_LATE = 0;
+		static final int STATE_EARLY_ACCUMULATE = 1;
+		static final int STATE_EARLY_PROPAGATE = 2;
 
 		@Override
 		public void request(long n) {
 			if (Operators.validate(n)) {
+				if (STATE.get(this) == STATE_EARLY_ACCUMULATE) {
+					Operators.addCapCancellable(REQUESTED, this, n);
+					return;
+				}
+				if (STATE.get(this) == STATE_EARLY_PROPAGATE) {
+					parent.propagateRequest(n);
+				}
 				if (fusionMode() == NONE) {
 					Operators.addCapCancellable(REQUESTED, this, n);
 				}
-				ReplaySubscriber<T> p = parent;
-				if (p != null) {
-					p.buffer.replay(this);
-				}
+				parent.buffer.replay(this);
 			}
 		}
 
@@ -1401,7 +1468,7 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 		@Nullable
 		public Object scanUnsafe(Attr key) {
 			if (key == Attr.PARENT) return parent;
-			if (key == Attr.TERMINATED) return parent != null && parent.isTerminated();
+			if (key == Attr.TERMINATED) return parent.isTerminated();
 			if (key == Attr.BUFFERED) return size();
 			if (key == Attr.CANCELLED) return isCancelled();
 			if (key == Attr.REQUESTED_FROM_DOWNSTREAM) return Math.max(0L, requested);
@@ -1413,10 +1480,7 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 		@Override
 		public void cancel() {
 			if (REQUESTED.getAndSet(this, Long.MIN_VALUE) != Long.MIN_VALUE) {
-				ReplaySubscriber<T> p = parent;
-				if (p != null) {
-					p.remove(this);
-				}
+				parent.remove(this);
 				if (enter()) {
 					node = null;
 				}
@@ -1425,7 +1489,13 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 
 		@Override
 		public long requested() {
-			return requested;
+			return REQUESTED.get(this);
+		}
+
+		@Override
+		public long signalConnectAndGetRequested() {
+			STATE.set(this, STATE_EARLY_PROPAGATE);
+			return REQUESTED.get(this);
 		}
 
 		@Override
@@ -1450,34 +1520,22 @@ final class FluxReplay<T> extends ConnectableFlux<T> implements Scannable, Fusea
 		@Override
 		@Nullable
 		public T poll() {
-			ReplaySubscriber<T> p = parent;
-			if(p != null){
-				return p.buffer.poll(this);
-			}
-			return null;
+			return parent.buffer.poll(this);
 		}
 
 		@Override
 		public void clear() {
-			ReplaySubscriber<T> p = parent;
-			if(p != null) {
-				p.buffer.clear(this);
-			}
+			parent.buffer.clear(this);
 		}
 
 		@Override
 		public boolean isEmpty() {
-			ReplaySubscriber<T> p = parent;
-			return p == null || p.buffer.isEmpty(this);
+			return parent.buffer.isEmpty(this);
 		}
 
 		@Override
 		public int size() {
-			ReplaySubscriber<T> p = parent;
-			if(p != null) {
-				return p.buffer.size(this);
-			}
-			return 0;
+			return parent.buffer.size(this);
 		}
 
 		@Override

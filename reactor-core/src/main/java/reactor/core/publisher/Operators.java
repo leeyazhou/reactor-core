@@ -16,8 +16,10 @@
 package reactor.core.publisher;
 
 import java.util.Collection;
+import java.util.Iterator;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.Spliterator;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -31,6 +33,7 @@ import java.util.stream.Stream;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+
 import reactor.core.CorePublisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
@@ -171,6 +174,17 @@ public abstract class Operators {
 	}
 
 	/**
+	 * Check whether the provided {@link Subscription} is the one used to satisfy Spec's §1.9 rule
+	 * before signalling an error.
+	 *
+	 * @param subscription the subscription to test.
+	 * @return true if passed subscription is a subscription created in {@link #reportThrowInSubscribe(CoreSubscriber, Throwable)}.
+	 */
+	public static boolean canAppearAfterOnSubscribe(Subscription subscription) {
+		return subscription == EmptySubscription.FROM_SUBSCRIBE_INSTANCE;
+	}
+
+	/**
 	 * Calls onSubscribe on the target Subscriber with the empty instance followed by a call to onError with the
 	 * supplied error.
 	 *
@@ -180,6 +194,40 @@ public abstract class Operators {
 	public static void error(Subscriber<?> s, Throwable e) {
 		s.onSubscribe(EmptySubscription.INSTANCE);
 		s.onError(e);
+	}
+
+	/**
+	 * Report a {@link Throwable} that was thrown from a call to {@link Publisher#subscribe(Subscriber)},
+	 * attempting to notify the {@link Subscriber} by:
+	 * <ol>
+	 *     <li>providing a special {@link Subscription} via {@link Subscriber#onSubscribe(Subscription)}</li>
+	 *     <li>immediately delivering an {@link Subscriber#onError(Throwable) onError} signal after that</li>
+	 * </ol>
+	 * <p>
+	 * As at that point the subscriber MAY have already been provided with a {@link Subscription}, we
+	 * assume most well formed subscribers will ignore this second {@link Subscription} per Reactive
+	 * Streams rule 1.9. Subscribers that don't usually ignore may recognize this special case and ignore
+	 * it by checking {@link #canAppearAfterOnSubscribe(Subscription)}.
+	 * <p>
+	 * Note that if the {@link Subscriber#onSubscribe(Subscription) onSubscribe} attempt throws,
+	 * {@link Exceptions#throwIfFatal(Throwable) fatal} exceptions are thrown. Other exceptions
+	 * are added as {@link Throwable#addSuppressed(Throwable) suppressed} on the original exception,
+	 * which is then directly notified as an {@link Subscriber#onError(Throwable) onError} signal
+	 * (again assuming that such exceptions occur because a {@link Subscription} is already set).
+	 *
+	 * @param subscriber the {@link Subscriber} being subscribed when the error happened
+	 * @param e the {@link Throwable} that was thrown from {@link Publisher#subscribe(Subscriber)}
+	 * @see #canAppearAfterOnSubscribe(Subscription)
+	 */
+	public static void reportThrowInSubscribe(CoreSubscriber<?> subscriber, Throwable e) {
+		try {
+			subscriber.onSubscribe(EmptySubscription.FROM_SUBSCRIBE_INSTANCE);
+		}
+		catch (Throwable onSubscribeError) {
+			Exceptions.throwIfFatal(onSubscribeError);
+			e.addSuppressed(onSubscribeError);
+		}
+		subscriber.onError(onOperatorError(e, subscriber.currentContext()));
 	}
 
 	/**
@@ -433,16 +481,33 @@ public abstract class Operators {
 				}
 
 				if (extract != null) {
-					extract.apply(toDiscard)
-					       .forEach(hook);
+					try {
+						extract.apply(toDiscard)
+						       .forEach(elementToDiscard -> {
+							       try {
+								       hook.accept(elementToDiscard);
+							       }
+							       catch (Throwable t) {
+								       log.warn("Error while discarding item extracted from a queue element, continuing with next item", t);
+							       }
+						       });
+					}
+					catch (Throwable t) {
+						log.warn("Error while extracting items to discard from queue element, continuing with next queue element", t);
+					}
 				}
 				else {
-					hook.accept(toDiscard);
+					try {
+						hook.accept(toDiscard);
+					}
+					catch (Throwable t) {
+						log.warn("Error while discarding a queue element, continuing with next queue element", t);
+					}
 				}
 			}
 		}
 		catch (Throwable t) {
-			log.warn("Error in discard hook while discarding and clearing a queue", t);
+			log.warn("Cannot further apply discard hook while discarding and clearing a queue", t);
 		}
 	}
 
@@ -463,10 +528,17 @@ public abstract class Operators {
 		if (hook != null) {
 			try {
 				multiple.filter(Objects::nonNull)
-				        .forEach(hook);
+				        .forEach(v -> {
+				        	try {
+				        		hook.accept(v);
+					        }
+				        	catch (Throwable t) {
+				        		log.warn("Error while discarding a stream element, continuing with next element", t);
+					        }
+				        });
 			}
 			catch (Throwable t) {
-				log.warn("Error in discard hook while discarding multiple values", t);
+				log.warn("Error while discarding stream, stopping", t);
 			}
 		}
 	}
@@ -492,12 +564,54 @@ public abstract class Operators {
 				}
 				for (Object o : multiple) {
 					if (o != null) {
-						hook.accept(o);
+						try {
+							hook.accept(o);
+						}
+						catch (Throwable t) {
+							log.warn("Error while discarding element from a Collection, continuing with next element", t);
+						}
 					}
 				}
 			}
 			catch (Throwable t) {
-				log.warn("Error in discard hook while discarding multiple values", t);
+				log.warn("Error while discarding collection, stopping", t);
+			}
+		}
+	}
+
+  /**
+   * Invoke a (local or global) hook that processes elements that remains in an {@link java.util.Iterator}.
+   * Since iterators can be infinite, this method requires that you explicitly ensure the iterator is
+   * {@code knownToBeFinite}. Typically, operating on an {@link Iterable} one can get such a
+   * guarantee by looking at the {@link Iterable#spliterator() Spliterator's} {@link Spliterator#getExactSizeIfKnown()}.
+   *
+   * @param multiple the {@link Iterator} whose remainder to discard
+   * @param knownToBeFinite is the caller guaranteeing that the iterator is finite and can be iterated over
+   * @param context the {@link Context} in which to look for local hook
+   * @see #onDiscard(Object, Context)
+   * @see #onDiscardMultiple(Collection, Context)
+   * @see #onDiscardQueueWithClear(Queue, Context, Function)
+   */
+	public static void onDiscardMultiple(@Nullable Iterator<?> multiple, boolean knownToBeFinite, Context context) {
+		if (multiple == null) return;
+		if (!knownToBeFinite) return;
+
+		Consumer<Object> hook = context.getOrDefault(Hooks.KEY_ON_DISCARD, null);
+		if (hook != null) {
+			try {
+				multiple.forEachRemaining(o -> {
+					if (o != null) {
+						try {
+							hook.accept(o);
+						}
+						catch (Throwable t) {
+							log.warn("Error while discarding element from an Iterator, continuing with next element", t);
+						}
+					}
+				});
+			}
+			catch (Throwable t) {
+				log.warn("Error while discarding Iterator, stopping", t);
 			}
 		}
 	}
@@ -1315,7 +1429,14 @@ public abstract class Operators {
 
 		CorePublisherAdapter(Publisher<T> publisher) {
 			this.publisher = publisher;
-			this.optimizableOperator = publisher instanceof OptimizableOperator ? (OptimizableOperator) publisher : null;
+			if (publisher instanceof OptimizableOperator) {
+				@SuppressWarnings("unchecked")
+				OptimizableOperator<?, T> optimSource = (OptimizableOperator<?, T>) publisher;
+				this.optimizableOperator = optimSource;
+			}
+			else {
+				this.optimizableOperator = null;
+			}
 		}
 
 		@Override
@@ -1344,7 +1465,7 @@ public abstract class Operators {
 		}
 	}
 
-	static final CoreSubscriber<?> EMPTY_SUBSCRIBER = new CoreSubscriber<Object>() {
+	static final Fuseable.ConditionalSubscriber<?> EMPTY_SUBSCRIBER = new Fuseable.ConditionalSubscriber<Object>() {
 		@Override
 		public void onSubscribe(Subscription s) {
 			Throwable e = new IllegalStateException("onSubscribe should not be used");
@@ -1355,6 +1476,13 @@ public abstract class Operators {
 		public void onNext(Object o) {
 			Throwable e = new IllegalStateException("onNext should not be used, got " + o);
 			log.error("Unexpected call to Operators.emptySubscriber()", e);
+		}
+
+		@Override
+		public boolean tryOnNext(Object o) {
+			Throwable e = new IllegalStateException("tryOnNext should not be used, got " + o);
+			log.error("Unexpected call to Operators.emptySubscriber()", e);
+			return false;
 		}
 
 		@Override
@@ -1397,13 +1525,11 @@ public abstract class Operators {
 		public void request(long n) {
 			// deliberately no op
 		}
-
-
-
 	}
 
 	final static class EmptySubscription implements QueueSubscription<Object>, Scannable {
 		static final EmptySubscription INSTANCE = new EmptySubscription();
+		static final EmptySubscription FROM_SUBSCRIBE_INSTANCE = new EmptySubscription();
 
 		@Override
 		public void cancel() {
@@ -1457,29 +1583,38 @@ public abstract class Operators {
 	public static class DeferredSubscription
 			implements Subscription, Scannable {
 
-		volatile Subscription s;
+		static final int STATE_CANCELLED = -2;
+		static final int STATE_SUBSCRIBED = -1;
+
+		Subscription s;
 		volatile long requested;
 
 		protected boolean isCancelled(){
-			return s == cancelledSubscription();
+			return requested == STATE_CANCELLED;
 		}
 
 		@Override
 		public void cancel() {
-			Subscription a = s;
-			if (a != cancelledSubscription()) {
-				a = S.getAndSet(this, cancelledSubscription());
-				if (a != null && a != cancelledSubscription()) {
-					a.cancel();
-				}
+			final long state = REQUESTED.getAndSet(this, STATE_CANCELLED);
+			if (state == STATE_CANCELLED) {
+				return;
 			}
+
+			if (state == STATE_SUBSCRIBED) {
+				this.s.cancel();
+			}
+		}
+
+		protected void terminate() {
+			REQUESTED.getAndSet(this, STATE_CANCELLED);
 		}
 
 		@Override
 		@Nullable
 		public Object scanUnsafe(Attr key) {
+			long requested = this.requested; // volatile read to see subscription
 			if (key == Attr.PARENT) return s;
-			if (key == Attr.REQUESTED_FROM_DOWNSTREAM) return requested;
+			if (key == Attr.REQUESTED_FROM_DOWNSTREAM) return requested < 0 ? 0 : requested;
 			if (key == Attr.CANCELLED) return isCancelled();
 
 			return null;
@@ -1487,23 +1622,33 @@ public abstract class Operators {
 
 		@Override
 		public void request(long n) {
-			Subscription a = s;
-			if (a != null) {
-				a.request(n);
-			}
-			else {
-				addCap(REQUESTED, this, n);
+			long r = this.requested; // volatile read beforehand
 
-				a = s;
+			if (r > STATE_SUBSCRIBED) { // works only in case onSubscribe has not happened
+				long u;
+				for (;;) { // normal CAS loop with overflow protection
+					if (r == Long.MAX_VALUE) { // if r == Long.MAX_VALUE then we dont care and we can loose this request just in case of racing
+						return;
+					}
+					u = Operators.addCap(r, n);
+					if (REQUESTED.compareAndSet(this, r, u)) { // Means increment happened before onSubscribe
+						return;
+					}
+					else { // Means increment happened after onSubscribe
+						r = this.requested; // update new state to see what exactly happened (onSubscribe | cancel | requestN)
 
-				if (a != null) {
-					long r = REQUESTED.getAndSet(this, 0L);
-
-					if (r != 0L) {
-						a.request(r);
+						if (r < 0) { // check state (expect -1 | -2 to exit, otherwise repeat)
+							break;
+						}
 					}
 				}
 			}
+
+			if (r == STATE_CANCELLED) { // if canceled, just exit
+				return;
+			}
+
+			this.s.request(n); // if onSubscribe -> subscription exists (and we sure of that because volatile read after volatile write) so we can execute requestN on the subscription
 		}
 
 		/**
@@ -1514,8 +1659,9 @@ public abstract class Operators {
 		 */
 		public final boolean set(Subscription s) {
 			Objects.requireNonNull(s, "s");
+			final long state = this.requested;
 			Subscription a = this.s;
-			if (a == cancelledSubscription()) {
+			if (state == STATE_CANCELLED) {
 				s.cancel();
 				return false;
 			}
@@ -1525,30 +1671,30 @@ public abstract class Operators {
 				return false;
 			}
 
-			if (S.compareAndSet(this, null, s)) {
+			long r;
+			long accumulated = 0;
+			for (;;) {
+				r = this.requested;
 
-				long r = REQUESTED.getAndSet(this, 0L);
-
-				if (r != 0L) {
-					s.request(r);
+				if (r == STATE_CANCELLED || r == STATE_SUBSCRIBED) {
+					s.cancel();
+					return false;
 				}
 
-				return true;
+				this.s = s;
+
+				long toRequest = r - accumulated;
+				if (toRequest > 0) { // if there is something,
+					s.request(toRequest); // then we do a request on the given subscription
+				}
+				accumulated += toRequest;
+
+				if (REQUESTED.compareAndSet(this, r, STATE_SUBSCRIBED)) {
+					return true;
+				}
 			}
-
-			a = this.s;
-
-			if (a != cancelledSubscription()) {
-				s.cancel();
-				reportSubscriptionSet();
-				return false;
-			}
-
-			return false;
 		}
 
-		static final AtomicReferenceFieldUpdater<DeferredSubscription, Subscription> S =
-				AtomicReferenceFieldUpdater.newUpdater(DeferredSubscription.class, Subscription.class, "s");
 		static final AtomicLongFieldUpdater<DeferredSubscription> REQUESTED =
 				AtomicLongFieldUpdater.newUpdater(DeferredSubscription.class, "requested");
 
@@ -1579,10 +1725,9 @@ public abstract class Operators {
 		@Override
 		public void cancel() {
 			O v = value;
-			if (STATE.getAndSet(this, CANCELLED) <= HAS_REQUEST_NO_VALUE) {
-				discard(v);
-			}
 			value = null;
+			STATE.set(this, CANCELLED);
+			discard(v);
 		}
 
 		@Override

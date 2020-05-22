@@ -132,42 +132,29 @@ public class MonoDelayElementTest {
 		AtomicReference<Throwable> errorDropped = new AtomicReference<>();
 		Hooks.onErrorDropped(errorDropped::set);
 
-		try {
-			StepVerifier.withVirtualTime(() ->
-					new MonoDelayElement<>(source.mono(), 2, TimeUnit.SECONDS, defaultSchedulerForDelay()))
-			            .expectSubscription()
-			            .then(() -> source.next("foo").error(new IllegalStateException("boom")))
-			            .expectNoEvent(Duration.ofSeconds(2))
-			            .expectNext("foo")
-			            .verifyComplete();
-		} finally {
-			Hooks.resetOnErrorDropped();
-		}
+		StepVerifier.withVirtualTime(() ->
+				new MonoDelayElement<>(source.mono(), 2, TimeUnit.SECONDS, defaultSchedulerForDelay()))
+		            .expectSubscription()
+		            .then(() -> source.next("foo").error(new IllegalStateException("boom")))
+		            .expectNoEvent(Duration.ofSeconds(2))
+		            .expectNext("foo")
+		            .verifyComplete();
 
 		assertThat(errorDropped.get()).isNull();
 	}
 
 	@Test
 	public void onNextOnDisposedSchedulerThrows() {
-		Scheduler scheduler = Schedulers.newSingle("onNextOnDisposedSchedulerThrows");
+		VirtualTimeScheduler scheduler = VirtualTimeScheduler.create();
 		scheduler.dispose();
 		Mono<String> source = Mono.just("foo").hide();
 
-		try {
-			StepVerifier.create(new MonoDelayElement<>(source, 2, TimeUnit.SECONDS, scheduler))
-			            .expectSubscription()
-			            .verifyComplete(); //complete not relevant
-			fail("expected exception here");
-		}
-		catch (Throwable e) {
-			Throwable t = Exceptions.unwrap(e);
-
-			assertThat(t).isEqualTo(e)
-		                 .isInstanceOf(RejectedExecutionException.class)
-		                 .hasMessage("Scheduler unavailable");
-
-			assertThat(e).satisfies(Exceptions::isBubbling);
-		}
+		StepVerifier.create(new MonoDelayElement<>(source, 2, TimeUnit.SECONDS, scheduler))
+		            .expectErrorSatisfies(e -> {
+		            	assertThat(e)
+					            .isInstanceOf(RejectedExecutionException.class)
+					            .hasMessage("Scheduler unavailable");
+		            });
 	}
 
 	@Test
@@ -194,24 +181,19 @@ public class MonoDelayElementTest {
 	public void cancelUpstreamOnceWhenRejected() {
 		VirtualTimeScheduler vts = VirtualTimeScheduler.create();
 		vts.dispose();
-		AtomicLong upstreamCancelCount = new AtomicLong();
 
-		Mono<String> source = Mono.just("foo").log().hide()
-		                          .doOnCancel(upstreamCancelCount::incrementAndGet);
+		TestPublisher<Object> testPublisher = TestPublisher.createCold();
+		testPublisher.emit("Hello");
 
-		try {
-			StepVerifier.withVirtualTime(
-					() -> new MonoDelayElement<>(source, 2, TimeUnit.SECONDS, vts).log(),
-					() -> vts, Long.MAX_VALUE)
-			            .expectSubscription()
-			            .verifyComplete();
-		}
-		catch (Throwable e) {
-			assertThat(e).hasMessageContaining("Scheduler unavailable");
-		}
-		finally {
-			assertThat(upstreamCancelCount.get()).isEqualTo(1);
-		}
+		StepVerifier.create(new MonoDelayElement<>(testPublisher.mono(), 2, TimeUnit.SECONDS, vts))
+		            .verifyErrorSatisfies(e -> {
+			            assertThat(e)
+					            .isInstanceOf(RejectedExecutionException.class)
+					            .hasMessage("Scheduler unavailable");
+		            });
+
+		testPublisher.assertWasRequested();
+		testPublisher.assertCancelled(1);
 	}
 
 	@Test
@@ -302,19 +284,14 @@ public class MonoDelayElementTest {
 			s.onError(new IllegalStateException("boom"));
 		});
 
-		try {
-			StepVerifier.withVirtualTime(() -> new MonoDelayElement<>(source,
-					2,
-					TimeUnit.SECONDS,
-					defaultSchedulerForDelay()))
-			            .expectSubscription()
-			            .expectNoEvent(Duration.ofSeconds(2))
-			            .expectNext("foo")
-			            .verifyComplete();
-		}
-		finally {
-			Hooks.resetOnErrorDropped();
-		}
+		StepVerifier.withVirtualTime(() -> new MonoDelayElement<>(source,
+				2,
+				TimeUnit.SECONDS,
+				defaultSchedulerForDelay()))
+		            .expectSubscription()
+		            .expectNoEvent(Duration.ofSeconds(2))
+		            .expectNext("foo")
+		            .verifyComplete();
 		assertThat(dropped.get()).hasMessage("boom")
 		                         .isInstanceOf(IllegalStateException.class);
 	}
@@ -329,8 +306,9 @@ public class MonoDelayElementTest {
 				.doOnSubscribe(s -> {
 					assertThat(s).isInstanceOf(MonoDelayElement.DelayElementSubscriber.class);
 
-					MonoDelayElement.DelayElementSubscriber delayedSubscriber =
-							(MonoDelayElement.DelayElementSubscriber) s;
+					@SuppressWarnings("unchecked")
+					MonoDelayElement.DelayElementSubscriber<Integer> delayedSubscriber =
+							(MonoDelayElement.DelayElementSubscriber<Integer>) s;
 
 					upstream.set(delayedSubscriber.scan(Scannable.Attr.PARENT));
 				}))
@@ -351,7 +329,7 @@ public class MonoDelayElementTest {
 			s.onNext("foo");
 		})
 		.doOnCancel(sourceOnCancel::incrementAndGet)
-		.doOnSuccessOrError((v, e) -> sourceOnTerminate.incrementAndGet());
+		.doOnTerminate(sourceOnTerminate::incrementAndGet);
 
 
 		StepVerifier.withVirtualTime(() -> new MonoDelayElement<>(source,
@@ -359,7 +337,7 @@ public class MonoDelayElementTest {
 				TimeUnit.SECONDS,
 				defaultSchedulerForDelay())
 				.doOnCancel(onCancel::incrementAndGet)
-				.doOnSuccessOrError((v, e) -> onTerminate.incrementAndGet()))
+				.doOnTerminate(onTerminate::incrementAndGet))
 		            .expectSubscription()
 		            .expectNoEvent(Duration.ofSeconds(2))
 		            .expectNext("foo")

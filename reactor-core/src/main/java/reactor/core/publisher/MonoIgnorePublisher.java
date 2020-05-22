@@ -18,6 +18,7 @@ package reactor.core.publisher;
 import java.util.Objects;
 
 import org.reactivestreams.Publisher;
+
 import reactor.core.CorePublisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Scannable;
@@ -39,16 +40,29 @@ final class MonoIgnorePublisher<T> extends Mono<T> implements Scannable,
 
 	MonoIgnorePublisher(Publisher<? extends T> source) {
 		this.source = Objects.requireNonNull(source, "publisher");
-		this.optimizableOperator = source instanceof OptimizableOperator ? (OptimizableOperator) source : null;
+		if (source instanceof OptimizableOperator) {
+			@SuppressWarnings("unchecked")
+			OptimizableOperator<?, T> optimSource = (OptimizableOperator<?, T>) source;
+			this.optimizableOperator = optimSource;
+		}
+		else {
+			this.optimizableOperator = null;
+		}
 	}
 
 	@Override
 	public void subscribe(CoreSubscriber<? super T> actual) {
-		source.subscribe(subscribeOrReturn(actual));
+		try {
+			source.subscribe(subscribeOrReturn(actual));
+		}
+		catch (Throwable e) {
+			Operators.error(actual, Operators.onOperatorError(e, actual.currentContext()));
+			return;
+		}
 	}
 
 	@Override
-	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) {
+	public final CoreSubscriber<? super T> subscribeOrReturn(CoreSubscriber<? super T> actual) throws Throwable {
 		return new MonoIgnoreElements.IgnoreElementsSubscriber<>(actual);
 	}
 

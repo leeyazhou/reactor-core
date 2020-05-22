@@ -16,20 +16,20 @@
 
 package reactor.core.publisher;
 
-import org.junit.After;
-import org.junit.Test;
-import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
-import org.reactivestreams.Subscription;
-import reactor.core.Disposable;
-import reactor.core.Disposables;
-import reactor.core.scheduler.Schedulers;
-
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+
+import org.junit.Test;
+import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
+
+import reactor.core.Disposable;
+import reactor.core.Disposables;
+import reactor.core.scheduler.Schedulers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
@@ -47,14 +47,10 @@ public class TailCallSubscribeTest {
         for (int i = 0; i < 5; i++) {
             mono = mono.<Object>map(Object::toString).filter(Objects::nonNull);
         }
-        //noinspection unchecked
-        return (Mono) mono;
+        @SuppressWarnings("unchecked")
+        Mono<Object> result = (Mono<Object>) mono;
+	    return result;
     };
-
-    @After
-    public void tearDown() {
-        Hooks.resetOnOperatorDebug();
-    }
 
     @Test
     public void testStackDepth() throws Exception {

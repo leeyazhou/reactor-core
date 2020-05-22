@@ -29,18 +29,22 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.assertj.core.api.Assertions;
 import org.junit.Assert;
 import org.junit.Ignore;
-import org.junit.Rule;
 import org.junit.Test;
+
+import reactor.core.CoreSubscriber;
 import reactor.core.Fuseable;
 import reactor.core.publisher.DirectProcessor;
-import reactor.core.publisher.MonoProcessor;
+import reactor.core.publisher.EmitterProcessor;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoProcessor;
+import reactor.core.publisher.Operators;
 import reactor.core.publisher.UnicastProcessor;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -1865,7 +1869,6 @@ public class StepVerifierTests {
 	}
 
 	@Test
-	@SuppressWarnings("unchecked")
 	public void requestBufferDoesntOverflow() {
 		LongAdder requestCallCount = new LongAdder();
 		LongAdder totalRequest = new LongAdder();
@@ -1886,8 +1889,9 @@ public class StepVerifierTests {
 		            .expectComplete()
 		            .verify();
 
-		assertThat(requestCallCount.intValue()).isEqualTo(11); //10 elements then the completion
-		assertThat(totalRequest.longValue()).isEqualTo(11L); //ignores the main requests
+		//see same pattern in reactor.core.publisher.FluxBufferPredicateTest.requestBounded
+		assertThat(requestCallCount.intValue()).isEqualTo(9L);
+		assertThat(totalRequest.longValue()).isEqualTo(12L);
 	}
 
 	@Test(timeout = 1000L)
@@ -2131,7 +2135,7 @@ public class StepVerifierTests {
 		}
 	}
 
-	@Test
+	@Test(timeout = 5000)
 	public void gh783() {
 		int size = 1;
 		Scheduler parallel = Schedulers.newParallel("gh-783");
@@ -2150,7 +2154,7 @@ public class StepVerifierTests {
 		            .verifyComplete();
 	}
 
-	@Test
+	@Test(timeout = 5000)
 	public void gh783_deferredAdvanceTime() {
 		int size = 61;
 		Scheduler parallel = Schedulers.newParallel("gh-783");
@@ -2342,5 +2346,52 @@ public class StepVerifierTests {
 				.verifyComplete();
 
 		assertThat(requests).containsExactly(1L, 1L, 1L);
+	}
+
+	//see https://github.com/reactor/reactor-core/issues/2060
+	@Test
+	public void externalGetOrSetTakenIntoAccount() {
+		Scheduler.Worker subscriptionWorker = VirtualTimeScheduler.getOrSet().createWorker();
+		List<String> source = Stream.of("first", "second", "third").collect(Collectors.toList());
+
+
+		StepVerifier.withVirtualTime(() -> {
+			EmitterProcessor<String> fluxEmitter = EmitterProcessor.create();
+
+			subscriptionWorker.schedulePeriodically(() -> {
+				if (source.size() > 0) {
+					fluxEmitter.onNext(source.remove(0));
+				}
+				else {
+					fluxEmitter.onComplete();
+				}
+			}, 0, 10, TimeUnit.MILLISECONDS);
+			return fluxEmitter;
+		})
+		            .expectNext("first")
+		            .expectNoEvent(Duration.ofMillis(10))
+		            .expectNext("second")
+		            .expectNoEvent(Duration.ofMillis(10))
+		            .expectNext("third")
+		            .expectNoEvent(Duration.ofMillis(10))
+		            .expectComplete()
+		            .verify(Duration.ofSeconds(2));
+	}
+
+	// See https://github.com/reactor/reactor-core/issues/2107
+	@Test
+	public void mutualizedSubscribeErrorHandlingPostOnSubscribe() {
+		Flux<Object> errorInSubscribeFlux = new Flux<Object>() {
+			@Override
+			public void subscribe(CoreSubscriber<? super Object> actual) {
+				actual.onSubscribe(Operators.emptySubscription());
+				throw new IllegalStateException("ErrorInSubscribeFlux");
+			}
+		};
+		StepVerifier.create(errorInSubscribeFlux).verifyErrorSatisfies(e -> {
+            assertThat(e)
+		            .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("ErrorInSubscribeFlux");
+        });
 	}
 }
